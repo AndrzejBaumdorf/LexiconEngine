@@ -3,32 +3,29 @@
 
 ## 現在できること
 
-- SQLiteに単語、日本語訳、例文、類義語・対義語、回答履歴を保存
-- 英単語から日本語訳を選ぶ4択クイズ
-- 直近10問の正答率を回答ごとに表示
+- 単語、言語、品詞、複数の語義、例文、類義語・対義語、出典、難易度をSQLiteに保存
+- 英→日、日→英、例文穴埋め、類義語・対義語の4択問題
+- 問題形式ごとの回答履歴と直近10問の正答率
+- 直近の不正解を重くするpriority出題
 - CSVから単語データを取り込み
 
 ## 起動
 
-Python 3.10以上で実行します。
-
 ```powershell
-python3 src/main.py --init
+py src/main.py --init
 ```
 
-初回起動時は `data/lexicon.db` を作成し、動作確認用のサンプル単語を登録します。教材データは `materials/` に置いてください。このディレクトリとDBはGit管理対象外です。
+問題形式を選ぶと出題が始まります。終了は `q` です。教材データは `materials/` に置いてください。このディレクトリとDBはGit管理対象外です。
 
 ## CSV形式
 
-教材データの取り込みには、次の列を持つUTF-8 CSVを使います。
+必須列は `word,meaning_ja` です。その他の列は任意です。
 
 ```csv
-word,meaning_ja,example_sentence
-word,日本語訳,Example sentence.
+word,language,part_of_speech,meaning_ja,example_sentence,translation_ja,difficulty,source
+abundant,English,形容詞,豊富な,The region has abundant natural resources.,,B2,The Japan Times EX
 ```
 
 ```powershell
-python3 src/main.py --import-csv materials/words.csv
+py src/main.py --import-csv materials/words.csv
 ```
-
-既存単語の `word` が一致する場合は、日本語訳と例文を更新します。
