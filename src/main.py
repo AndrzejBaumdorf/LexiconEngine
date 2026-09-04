@@ -354,7 +354,7 @@ def main() -> None:
     database_exists = args.db.exists()
     database = LexiconDatabase(args.db)
     try:
-        database.initialize(seed_samples=args.init or not database_exists)
+        database.initialize(seed_samples=not args.import_json and (args.init or not database_exists))
         if args.import_csv:
             print(f"{database.import_csv(args.import_csv)}件取り込みました。")
         if args.import_json:
