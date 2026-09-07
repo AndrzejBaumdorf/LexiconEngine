@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import random
 import sqlite3
@@ -10,6 +9,7 @@ from pathlib import Path
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon.db"
+DEFAULT_SAMPLE_JSON_PATH = Path(__file__).resolve().parent.parent / "materials" / "sample_words.json"
 RECENT_HISTORY_LIMIT = 10
 QUESTION_TYPES = {"1": "english_to_japanese", "2": "japanese_to_english", "3": "cloze", "4": "relation"}
 QUESTION_LABELS = {"english_to_japanese": "英→日", "japanese_to_english": "日→英", "cloze": "例文穴埋め", "relation": "類義語・対義語"}
@@ -24,16 +24,6 @@ class Question:
     answer: str
 
 
-SAMPLE_WORDS = [
-    ("abundant", "形容詞", "豊富な", "The region has abundant natural resources.", "B2"),
-    ("accurate", "形容詞", "正確な", "Please provide accurate information.", "B1"),
-    ("adapt", "動詞", "適応する", "Animals adapt to changes in their environment.", "B1"),
-    ("clarify", "動詞", "明確にする", "Could you clarify your main point?", "B2"),
-    ("eliminate", "動詞", "取り除く", "The new process will eliminate unnecessary steps.", "B2"),
-    ("scarce", "形容詞", "不足した", "Water is scarce in the dry season.", "B2"),
-]
-
-
 class LexiconDatabase:
     def __init__(self, path: Path):
         self.path = path
@@ -44,7 +34,7 @@ class LexiconDatabase:
     def close(self) -> None:
         self.connection.close()
 
-    def initialize(self, seed_samples: bool = True) -> None:
+    def initialize(self) -> None:
         self._migrate_legacy_schema()
         self.connection.executescript(
             """
@@ -80,8 +70,6 @@ class LexiconDatabase:
             );
             """
         )
-        if seed_samples:
-            self._seed_samples()
         self.connection.commit()
 
     def _migrate_legacy_schema(self) -> None:
@@ -107,43 +95,6 @@ class LexiconDatabase:
         )
         self.connection.commit()
         self.connection.execute("PRAGMA foreign_keys = ON")
-
-    def _seed_samples(self) -> None:
-        self.connection.execute("INSERT OR IGNORE INTO sources(name) VALUES ('The Japan Times EX')")
-        source_id = self.connection.execute("SELECT id FROM sources WHERE name=?", ("The Japan Times EX",)).fetchone()[0]
-        for word, pos, meaning, sentence, difficulty in SAMPLE_WORDS:
-            self.connection.execute("INSERT INTO words (word, part_of_speech, difficulty, source_id) VALUES (?, ?, ?, ?) ON CONFLICT(word, language) DO UPDATE SET part_of_speech=excluded.part_of_speech, difficulty=excluded.difficulty, source_id=excluded.source_id", (word, pos, difficulty, source_id))
-            word_id = self.connection.execute("SELECT id FROM words WHERE word=?", (word,)).fetchone()[0]
-            self.connection.execute("INSERT OR IGNORE INTO meanings(word_id, meaning_ja) VALUES (?, ?)", (word_id, meaning))
-            self.connection.execute("INSERT OR IGNORE INTO examples(word_id, sentence) VALUES (?, ?)", (word_id, sentence))
-        self._add_relation("abundant", "scarce", "antonym")
-
-    def _add_relation(self, word: str, related: str, relation_type: str) -> None:
-        first = self.connection.execute("SELECT id FROM words WHERE word=?", (word,)).fetchone()
-        second = self.connection.execute("SELECT id FROM words WHERE word=?", (related,)).fetchone()
-        if first and second:
-            self.connection.execute("INSERT OR IGNORE INTO word_relations VALUES (?, ?, ?)", (first[0], second[0], relation_type))
-
-    def import_csv(self, csv_path: Path) -> int:
-        with csv_path.open(newline="", encoding="utf-8-sig") as file:
-            rows = csv.DictReader(file)
-            if not rows.fieldnames or not {"word", "meaning_ja"}.issubset(rows.fieldnames):
-                raise ValueError("CSVには word, meaning_ja 列が必要です")
-            imported = 0
-            for row in rows:
-                source = (row.get("source") or "CSV").strip()
-                source_id = self.connection.execute("INSERT OR IGNORE INTO sources(name) VALUES (?)", (source,)).lastrowid
-                if not source_id:
-                    source_id = self.connection.execute("SELECT id FROM sources WHERE name=?", (source,)).fetchone()[0]
-                word = row["word"].strip()
-                self.connection.execute("INSERT INTO words (word, language, part_of_speech, difficulty, source_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(word, language) DO UPDATE SET part_of_speech=excluded.part_of_speech, difficulty=excluded.difficulty, source_id=excluded.source_id", (word, row.get("language") or "English", row.get("part_of_speech"), row.get("difficulty"), source_id))
-                word_id = self.connection.execute("SELECT id FROM words WHERE word=? AND language=?", (word, row.get("language") or "English")).fetchone()[0]
-                self.connection.execute("INSERT OR IGNORE INTO meanings(word_id, meaning_ja) VALUES (?, ?)", (word_id, row["meaning_ja"].strip()))
-                if row.get("example_sentence"):
-                    self.connection.execute("INSERT OR IGNORE INTO examples(word_id, sentence, translation_ja) VALUES (?, ?, ?)", (word_id, row["example_sentence"].strip(), row.get("translation_ja")))
-                imported += 1
-        self.connection.commit()
-        return imported
 
     def import_json(self, json_path: Path) -> int:
         with json_path.open(encoding="utf-8") as file:
@@ -348,15 +299,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SQLiteベースの英単語クイズ")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--init", action="store_true")
-    parser.add_argument("--import-csv", type=Path)
     parser.add_argument("--import-json", type=Path)
     args = parser.parse_args()
     database_exists = args.db.exists()
     database = LexiconDatabase(args.db)
     try:
-        database.initialize(seed_samples=not args.import_json and (args.init or not database_exists))
-        if args.import_csv:
-            print(f"{database.import_csv(args.import_csv)}件取り込みました。")
+        database.initialize()
+        if not args.import_json and (args.init or not database_exists):
+            print(f"{database.import_json(DEFAULT_SAMPLE_JSON_PATH)}件取り込みました。")
         if args.import_json:
             print(f"{database.import_json(args.import_json)}件取り込みました。")
         run_quiz(database)

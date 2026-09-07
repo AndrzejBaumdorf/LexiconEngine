@@ -8,7 +8,6 @@
 - 問題形式ごとの回答履歴と直近10問の正答率
 - 直近の不正解を重くするpriority出題
 - JSONから単語データを構造化して取り込み
-- CSVから単純な単語データを補助的に取り込み
 
 ## 起動
 
@@ -45,17 +44,4 @@ JSONは単語オブジェクト、または単語オブジェクトの配列に�
 
 ```powershell
 py src/main.py --import-json materials/words.json
-```
-
-## CSV形式（補助）
-
-必須列は `word,meaning_ja` です。その他の列は任意です。
-
-```csv
-word,language,part_of_speech,meaning_ja,example_sentence,translation_ja,difficulty,source
-abundant,English,形容詞,豊富な,The region has abundant natural resources.,,B2,The Japan Times EX
-```
-
-```powershell
-py src/main.py --import-csv materials/words.csv
 ```
