@@ -345,10 +345,28 @@ class LexiconDatabase:
     def _choice_exclusion_ids(self, word_id: int) -> tuple[int, ...]:
         return (word_id, *self._related_word_ids(word_id))
 
-    def _weighted_word(self, question_type: str, join: str = "") -> sqlite3.Row:
+    def _choice_candidates(self, column: str, excluded_ids: tuple[int, ...], part_of_speech: str, answer: str) -> list[str]:
+        # 同じ品詞の候補を優先し、足りない場合のみ他の品詞で補う
+        placeholders = ", ".join("?" for _ in excluded_ids)
         rows = self.connection.execute(
             f"""
-            SELECT w.id, w.word, m.id AS meaning_id, m.meaning_ja,
+            SELECT {column}
+            FROM words w
+            JOIN parts_of_speech p ON p.word_id = w.id
+            JOIN meanings m ON m.part_of_speech_id = p.id
+            WHERE w.id NOT IN ({placeholders}) AND {column} != ? AND m.meaning_ja != w.word
+            GROUP BY {column}
+            ORDER BY MAX(p.name = ?) DESC, RANDOM()
+            LIMIT 3
+            """,
+            (*excluded_ids, answer, part_of_speech),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def _weighted_word(self, question_type: str, join: str = "", where: str = "1") -> sqlite3.Row:
+        rows = self.connection.execute(
+            f"""
+            SELECT w.id, w.word, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja,
                 COALESCE((
                     SELECT AVG(CASE WHEN recent.is_correct = 0 THEN 1.0 ELSE 0.0 END)
                     FROM (
@@ -363,6 +381,7 @@ class LexiconDatabase:
             JOIN parts_of_speech p ON p.word_id = w.id
             JOIN meanings m ON m.part_of_speech_id = p.id
             {join}
+            WHERE {where}
             GROUP BY w.id, m.id
             ORDER BY RANDOM()
             """,
@@ -374,17 +393,16 @@ class LexiconDatabase:
 
     def create_question(self, question_type: str, show_hint: bool = False) -> Question:
         if question_type == "english_to_japanese":
-            target = self._weighted_word(question_type)
+            # 類義語・対義語を文字列だけで登録すると英単語自体が意味になるため除外する
+            target = self._weighted_word(question_type, where="m.meaning_ja != w.word")
             excluded_ids = self._choice_exclusion_ids(target["id"])
-            placeholders = ", ".join("?" for _ in excluded_ids)
-            choices = [target["meaning_ja"], *(row[0] for row in self.connection.execute(f"SELECT DISTINCT m.meaning_ja FROM meanings m JOIN parts_of_speech p ON p.id=m.part_of_speech_id WHERE p.word_id NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT 3", excluded_ids).fetchall())]
+            choices = [target["meaning_ja"], *self._choice_candidates("m.meaning_ja", excluded_ids, target["part_of_speech"], target["meaning_ja"])]
             random.shuffle(choices)
             return Question(target["id"], question_type, target["word"], choices, target["meaning_ja"])
         if question_type == "japanese_to_english":
             target = self._weighted_word(question_type)
             excluded_ids = self._choice_exclusion_ids(target["id"])
-            placeholders = ", ".join("?" for _ in excluded_ids)
-            choices = [target["word"], *(row[0] for row in self.connection.execute(f"SELECT word FROM words WHERE id NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT 3", excluded_ids).fetchall())]
+            choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"])]
             random.shuffle(choices)
             return Question(target["id"], question_type, target["meaning_ja"], choices, target["word"])
         if question_type == "cloze":
@@ -394,8 +412,7 @@ class LexiconDatabase:
             if show_hint:
                 prompt += f"\nヒント: {target['meaning_ja']}"
             excluded_ids = self._choice_exclusion_ids(target["id"])
-            placeholders = ", ".join("?" for _ in excluded_ids)
-            choices = [target["word"], *(row[0] for row in self.connection.execute(f"SELECT word FROM words WHERE id NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT 3", excluded_ids).fetchall())]
+            choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"])]
             random.shuffle(choices)
             return Question(target["id"], question_type, prompt, choices, target["word"])
         if question_type == "relation":
@@ -414,7 +431,7 @@ class LexiconDatabase:
             ).fetchone()
             related_row = self.connection.execute(
                 """
-                SELECT w.id, w.word
+                SELECT w.id, w.word, p.name AS part_of_speech
                 FROM meanings m
                 JOIN parts_of_speech p ON p.id = m.part_of_speech_id
                 JOIN words w ON w.id = p.word_id
@@ -423,7 +440,7 @@ class LexiconDatabase:
                 (relation["related_meaning_id"],),
             ).fetchone()
             related = related_row["word"]
-            choices = [related, *(row[0] for row in self.connection.execute("SELECT word FROM words WHERE id NOT IN (?, ?) ORDER BY RANDOM() LIMIT 3", (target["id"], related_row["id"])).fetchall())]
+            choices = [related, *self._choice_candidates("w.word", (target["id"], related_row["id"]), related_row["part_of_speech"], related)]
             random.shuffle(choices)
             label = "類義語" if relation["relation_type"] == "synonym" else "対義語"
             return Question(target["id"], question_type, f"{target['word']} の{label}は?", choices, related)

@@ -38,7 +38,11 @@
         "meanings": [
           {
             "meaning_ja": "正確な",
-            "examples": [{"sentence": "Please provide accurate information."}]
+            "examples": [
+              {
+                "sentence": "Please provide accurate information."
+              }
+            ]
           }
         ]
       }
@@ -55,7 +59,11 @@
         "meanings": [
           {
             "meaning_ja": "適応する",
-            "examples": [{"sentence": "Animals adapt to changes in their environment."}]
+            "examples": [
+              {
+                "sentence": "Animals adapt to changes in their environment."
+              }
+            ]
           }
         ]
       }
@@ -72,7 +80,11 @@
         "meanings": [
           {
             "meaning_ja": "明確にする",
-            "examples": [{"sentence": "Could you clarify your main point?"}]
+            "examples": [
+              {
+                "sentence": "Could you clarify your main point?"
+              }
+            ]
           }
         ]
       }
@@ -89,7 +101,11 @@
         "meanings": [
           {
             "meaning_ja": "取り除く",
-            "examples": [{"sentence": "The new process will eliminate unnecessary steps."}]
+            "examples": [
+              {
+                "sentence": "The new process will eliminate unnecessary steps."
+              }
+            ]
           }
         ]
       }
@@ -106,7 +122,11 @@
         "meanings": [
           {
             "meaning_ja": "不足した",
-            "examples": [{"sentence": "Water is scarce in the dry season."}]
+            "examples": [
+              {
+                "sentence": "Water is scarce in the dry season."
+              }
+            ]
           }
         ]
       }
