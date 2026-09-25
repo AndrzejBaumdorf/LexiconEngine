@@ -2,80 +2,114 @@
   {
     "word": "abundant",
     "language": "English",
-    "part_of_speech": "形容詞",
-    "meanings": ["豊富な"],
-    "examples": [
-      {
-        "sentence": "The region has abundant natural resources."
-      }
-    ],
-    "antonyms": ["scarce"],
     "difficulty": "B2",
-    "source": "The Japan Times EX"
+    "source": "The Japan Times EX",
+    "parts_of_speech": [
+      {
+        "part_of_speech": "形容詞",
+        "meanings": [
+          {
+            "meaning_ja": "豊富な",
+            "antonyms": [
+              {
+                "word": "scarce",
+                "part_of_speech": "形容詞",
+                "meaning_ja": "不足した"
+              }
+            ],
+            "examples": [
+              {
+                "sentence": "The region has abundant natural resources."
+              }
+            ]
+          }
+        ]
+      }
+    ]
   },
   {
     "word": "accurate",
     "language": "English",
-    "part_of_speech": "形容詞",
-    "meanings": ["正確な"],
-    "examples": [
-      {
-        "sentence": "Please provide accurate information."
-      }
-    ],
     "difficulty": "B1",
-    "source": "The Japan Times EX"
+    "source": "The Japan Times EX",
+    "parts_of_speech": [
+      {
+        "part_of_speech": "形容詞",
+        "meanings": [
+          {
+            "meaning_ja": "正確な",
+            "examples": [{"sentence": "Please provide accurate information."}]
+          }
+        ]
+      }
+    ]
   },
   {
     "word": "adapt",
     "language": "English",
-    "part_of_speech": "動詞",
-    "meanings": ["適応する"],
-    "examples": [
-      {
-        "sentence": "Animals adapt to changes in their environment."
-      }
-    ],
     "difficulty": "B1",
-    "source": "The Japan Times EX"
+    "source": "The Japan Times EX",
+    "parts_of_speech": [
+      {
+        "part_of_speech": "動詞",
+        "meanings": [
+          {
+            "meaning_ja": "適応する",
+            "examples": [{"sentence": "Animals adapt to changes in their environment."}]
+          }
+        ]
+      }
+    ]
   },
   {
     "word": "clarify",
     "language": "English",
-    "part_of_speech": "動詞",
-    "meanings": ["明確にする"],
-    "examples": [
-      {
-        "sentence": "Could you clarify your main point?"
-      }
-    ],
     "difficulty": "B2",
-    "source": "The Japan Times EX"
+    "source": "The Japan Times EX",
+    "parts_of_speech": [
+      {
+        "part_of_speech": "動詞",
+        "meanings": [
+          {
+            "meaning_ja": "明確にする",
+            "examples": [{"sentence": "Could you clarify your main point?"}]
+          }
+        ]
+      }
+    ]
   },
   {
     "word": "eliminate",
     "language": "English",
-    "part_of_speech": "動詞",
-    "meanings": ["取り除く"],
-    "examples": [
-      {
-        "sentence": "The new process will eliminate unnecessary steps."
-      }
-    ],
     "difficulty": "B2",
-    "source": "The Japan Times EX"
+    "source": "The Japan Times EX",
+    "parts_of_speech": [
+      {
+        "part_of_speech": "動詞",
+        "meanings": [
+          {
+            "meaning_ja": "取り除く",
+            "examples": [{"sentence": "The new process will eliminate unnecessary steps."}]
+          }
+        ]
+      }
+    ]
   },
   {
     "word": "scarce",
     "language": "English",
-    "part_of_speech": "形容詞",
-    "meanings": ["不足した"],
-    "examples": [
-      {
-        "sentence": "Water is scarce in the dry season."
-      }
-    ],
     "difficulty": "B2",
-    "source": "The Japan Times EX"
+    "source": "The Japan Times EX",
+    "parts_of_speech": [
+      {
+        "part_of_speech": "形容詞",
+        "meanings": [
+          {
+            "meaning_ja": "不足した",
+            "examples": [{"sentence": "Water is scarce in the dry season."}]
+          }
+        ]
+      }
+    ]
   }
 ]

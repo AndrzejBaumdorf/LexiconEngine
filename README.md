@@ -19,25 +19,38 @@ py src/main.py --init
 
 ## JSON形式
 
-JSONは単語オブジェクト、または単語オブジェクトの配列にします。`meanings`、`examples`、`synonyms`、`antonyms` は複数指定できます。
+JSONは単語オブジェクト、または単語オブジェクトの配列にします。単語の下に品詞、品詞の下に意味を置きます。類義語・対義語は意味の下に置き、関連する単語・品詞・意味を指定します。
 
 ```json
 [
 	{
 		"word": "abandon",
 		"language": "English",
-		"part_of_speech": "verb",
 		"difficulty": "B2",
 		"source": "The Japan Times EX",
-		"meanings": ["放棄する", "断念する", "見捨てる"],
-		"examples": [
+		"parts_of_speech": [
 			{
-				"sentence": "They abandoned the plan.",
-				"translation_ja": "彼らは計画を断念した。"
+				"part_of_speech": "動詞",
+				"meanings": [
+					{
+						"meaning_ja": "放棄する",
+						"synonyms": [
+							{
+								"word": "forsake",
+								"part_of_speech": "動詞",
+								"meaning_ja": "見捨てる"
+							}
+						],
+						"examples": [
+							{
+								"sentence": "They abandoned the plan.",
+								"translation_ja": "彼らは計画を断念した。"
+							}
+						]
+					}
+				]
 			}
-		],
-		"synonyms": ["forsake", "relinquish"],
-		"antonyms": ["retain", "preserve"]
+		]
 	}
 ]
 ```
