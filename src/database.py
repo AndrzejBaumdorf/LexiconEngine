@@ -8,6 +8,8 @@ from pathlib import Path
 
 
 RECENT_HISTORY_LIMIT = 10
+# 類義語・対義語を文字列だけで登録すると英単語自体が意味になるため、出題対象から除外する
+HAS_REAL_MEANING = "m.meaning_ja != w.word"
 
 
 @dataclass(frozen=True)
@@ -354,7 +356,7 @@ class LexiconDatabase:
             FROM words w
             JOIN parts_of_speech p ON p.word_id = w.id
             JOIN meanings m ON m.part_of_speech_id = p.id
-            WHERE w.id NOT IN ({placeholders}) AND {column} != ? AND m.meaning_ja != w.word
+            WHERE w.id NOT IN ({placeholders}) AND {column} != ? AND {HAS_REAL_MEANING}
             GROUP BY {column}
             ORDER BY MAX(p.name = ?) DESC, RANDOM()
             LIMIT 3
@@ -393,20 +395,19 @@ class LexiconDatabase:
 
     def create_question(self, question_type: str, show_hint: bool = False) -> Question:
         if question_type == "english_to_japanese":
-            # 類義語・対義語を文字列だけで登録すると英単語自体が意味になるため除外する
-            target = self._weighted_word(question_type, where="m.meaning_ja != w.word")
+            target = self._weighted_word(question_type, where=HAS_REAL_MEANING)
             excluded_ids = self._choice_exclusion_ids(target["id"])
             choices = [target["meaning_ja"], *self._choice_candidates("m.meaning_ja", excluded_ids, target["part_of_speech"], target["meaning_ja"])]
             random.shuffle(choices)
             return Question(target["id"], question_type, target["word"], choices, target["meaning_ja"])
         if question_type == "japanese_to_english":
-            target = self._weighted_word(question_type)
+            target = self._weighted_word(question_type, where=HAS_REAL_MEANING)
             excluded_ids = self._choice_exclusion_ids(target["id"])
             choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"])]
             random.shuffle(choices)
             return Question(target["id"], question_type, target["meaning_ja"], choices, target["word"])
         if question_type == "cloze":
-            target = self._weighted_word(question_type, "JOIN examples e ON e.word_id=w.id")
+            target = self._weighted_word(question_type, "JOIN examples e ON e.word_id=w.id", HAS_REAL_MEANING)
             sentence = self.connection.execute("SELECT sentence FROM examples WHERE word_id=? ORDER BY RANDOM() LIMIT 1", (target["id"],)).fetchone()[0]
             prompt = sentence.replace(target["word"], "_____")
             if show_hint:
