@@ -2,14 +2,90 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import sqlite3
 from dataclasses import dataclass
+from typing import NamedTuple
+from difflib import SequenceMatcher
 from pathlib import Path
+
+from cloze import blank_out, find_cloze_spans
+from languages import FORM_KEYS, GENDERS, get_language
 
 
 RECENT_HISTORY_LIMIT = 10
 # 類義語・対義語を文字列だけで登録すると英単語自体が意味になるため、出題対象から除外する
 HAS_REAL_MEANING = "m.meaning_ja != w.word"
+CHOICE_POOL_SIZE = 30
+SIMILAR_MEANING_RATIO = 0.6
+MEANING_SEPARATOR = "\x1f"
+ANNOTATION_PATTERN = re.compile(r"[〈（(［\[《][^〉）)］\]》]*[〉）)］\]》]")
+CONTENT_PATTERN = re.compile(r"[\u3400-\u9fff々\u30a1-\u30ff]")
+LEGACY_POS_NAMES = {"noun": "名詞", "verb": "動詞", "adjective": "形容詞", "adverb": "副詞"}
+
+
+def _meaning_key(meaning_ja: str) -> str:
+    # 〈批評などが〉のような注記と記号を除き、漢字・カタカナがあればそれだけで比べる (辛らつな / 辛辣な → 辛 / 辛辣)
+    text = re.sub(r"[〜～…、，,；;・\s]", "", ANNOTATION_PATTERN.sub("", meaning_ja))
+    return "".join(CONTENT_PATTERN.findall(text)) or text
+
+
+def meanings_similar(first: str, second: str) -> bool:
+    first, second = _meaning_key(first), _meaning_key(second)
+    return bool(first and second) and SequenceMatcher(None, first, second).ratio() >= SIMILAR_MEANING_RATIO
+
+
+def normalize_derivatives(entry: dict) -> list[dict]:
+    """derivatives と旧形式の related_words ({"noun": "x"} など) を {word, part_of_speech, meaning_ja?} の配列にそろえる"""
+    word = entry.get("word")
+    derivatives = entry.get("derivatives", [])
+    related_words = entry.get("related_words", {})
+    if not isinstance(derivatives, list) or not isinstance(related_words, dict):
+        raise ValueError(f"{word}: derivatives は配列、related_words はオブジェクトにしてください")
+    items = list(derivatives)
+    for key, values in related_words.items():
+        for value in values if isinstance(values, list) else [values]:
+            item = {"word": value} if isinstance(value, str) else dict(value) if isinstance(value, dict) else None
+            if item is None:
+                raise ValueError(f"{word}: related_words の各要素は文字列またはオブジェクトにしてください")
+            item.setdefault("part_of_speech", LEGACY_POS_NAMES.get(key, key))
+            items.append(item)
+
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict) or not all(isinstance(item.get(key), str) and item[key].strip() for key in ("word", "part_of_speech")):
+            raise ValueError(f"{word}: 派生語には word と part_of_speech が必要です")
+        derivative = {"word": item["word"].strip(), "part_of_speech": item["part_of_speech"].strip()}
+        meaning_ja = item.get("meaning_ja")
+        if isinstance(meaning_ja, str) and meaning_ja.strip():
+            derivative["meaning_ja"] = meaning_ja.strip()
+        normalized.append(derivative)
+    return normalized
+
+
+@dataclass(frozen=True)
+class QuizScope:
+    """出題範囲。None の条件は絞り込まない。誤答の選択肢は範囲に関係なく同じ言語の単語から選ぶ"""
+    language: str | None = None
+    source: str | None = None
+    difficulty: str | None = None
+
+    def condition(self, alias: str = "w") -> tuple[str, tuple]:
+        return (
+            f"(? IS NULL OR {alias}.language = ?)"
+            f" AND (? IS NULL OR {alias}.source_id IN (SELECT id FROM sources WHERE name = ?))"
+            f" AND (? IS NULL OR {alias}.difficulty = ?)",
+            (self.language, self.language, self.source, self.source, self.difficulty, self.difficulty),
+        )
+
+
+class ClozeSentence(NamedTuple):
+    prompt: str
+    # 穴の語の形 (英語の past / participle など)。判定できなければ None
+    form: str | None
+    surface: str
+    # 例文が属する意味。旧形式のJSONから取り込んだ例文は None
+    meaning_id: int | None
 
 
 @dataclass(frozen=True)
@@ -19,6 +95,8 @@ class Question:
     prompt: str
     choices: list[str]
     answer: str
+    # 正解の補足表示 (穴埋めで活用形が正解のとき "petrified (petrify)" など)
+    answer_detail: str = ""
 
 
 class LexiconDatabase:
@@ -49,11 +127,13 @@ class LexiconDatabase:
             );
             CREATE TABLE IF NOT EXISTS meanings (
                 id INTEGER PRIMARY KEY, part_of_speech_id INTEGER NOT NULL, meaning_ja TEXT NOT NULL,
-                UNIQUE(part_of_speech_id, meaning_ja), FOREIGN KEY (part_of_speech_id) REFERENCES parts_of_speech(id) ON DELETE CASCADE
+                forms TEXT, UNIQUE(part_of_speech_id, meaning_ja), FOREIGN KEY (part_of_speech_id) REFERENCES parts_of_speech(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS examples (
                 id INTEGER PRIMARY KEY, word_id INTEGER NOT NULL, sentence TEXT NOT NULL,
-                translation_ja TEXT, UNIQUE(word_id, sentence), FOREIGN KEY (word_id) REFERENCES words(id) ON DELETE CASCADE
+                translation_ja TEXT, targets TEXT, meaning_id INTEGER, UNIQUE(word_id, sentence),
+                FOREIGN KEY (word_id) REFERENCES words(id) ON DELETE CASCADE,
+                FOREIGN KEY (meaning_id) REFERENCES meanings(id) ON DELETE SET NULL
             );
             CREATE TABLE IF NOT EXISTS word_relations (
                 word_id INTEGER NOT NULL, related_word_id INTEGER NOT NULL,
@@ -69,6 +149,12 @@ class LexiconDatabase:
                 FOREIGN KEY (meaning_id) REFERENCES meanings(id) ON DELETE CASCADE,
                 FOREIGN KEY (related_meaning_id) REFERENCES meanings(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS derivations (
+                word_id INTEGER NOT NULL, derived_word_id INTEGER NOT NULL, part_of_speech TEXT NOT NULL,
+                PRIMARY KEY (word_id, derived_word_id),
+                FOREIGN KEY (word_id) REFERENCES words(id) ON DELETE CASCADE,
+                FOREIGN KEY (derived_word_id) REFERENCES words(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS answer_history (
                 id INTEGER PRIMARY KEY, word_id INTEGER NOT NULL, question_type TEXT NOT NULL,
                 selected_answer TEXT NOT NULL, correct_answer TEXT NOT NULL,
@@ -79,7 +165,29 @@ class LexiconDatabase:
             """
         )
         self._migrate_meaning_schema()
+        self._add_missing_columns()
         self.connection.commit()
+
+    def _add_missing_columns(self) -> None:
+        for table, column, declaration in (
+            ("meanings", "forms", "TEXT"),
+            ("examples", "targets", "TEXT"),
+            ("examples", "meaning_id", "INTEGER REFERENCES meanings(id) ON DELETE SET NULL"),
+        ):
+            columns = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        # 旧形式の gender / plural 列は forms (JSON) に移して削除する
+        meaning_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(meanings)")}
+        legacy_columns = [column for column in ("gender", "plural") if column in meaning_columns]
+        if not legacy_columns:
+            return
+        for row in self.connection.execute(f"SELECT id, {', '.join(legacy_columns)} FROM meanings WHERE forms IS NULL").fetchall():
+            forms = {column: row[column] for column in legacy_columns if row[column]}
+            if forms:
+                self.connection.execute("UPDATE meanings SET forms=? WHERE id=?", (json.dumps(forms, ensure_ascii=False), row["id"]))
+        for column in legacy_columns:
+            self.connection.execute(f"ALTER TABLE meanings DROP COLUMN {column}")
 
     def _migrate_meaning_schema(self) -> None:
         meaning_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(meanings)")}
@@ -160,112 +268,195 @@ class LexiconDatabase:
         if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
             raise ValueError("JSONのルートは単語オブジェクトまたは単語オブジェクトの配列にしてください")
 
-        imported = 0
-        for entry in entries:
-            word = entry.get("word")
-            if not isinstance(word, str) or not word.strip():
-                raise ValueError("各単語データには word が必要です")
-            language = entry.get("language", "English")
-            source = entry.get("source", "JSON")
-            if not isinstance(language, str) or not isinstance(source, str):
-                raise ValueError("language と source は文字列にしてください")
-
-            self.connection.execute("INSERT OR IGNORE INTO sources(name) VALUES (?)", (source,))
-            source_id = self.connection.execute("SELECT id FROM sources WHERE name=?", (source,)).fetchone()[0]
-            self.connection.execute(
-                """
-                INSERT INTO words (word, language, difficulty, source_id)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(word, language) DO UPDATE SET
-                    difficulty=excluded.difficulty,
-                    source_id=excluded.source_id
-                """,
-                (word.strip(), language, entry.get("difficulty"), source_id),
-            )
-            word_id = self.connection.execute(
-                "SELECT id FROM words WHERE word=? AND language=?", (word.strip(), language)
-            ).fetchone()[0]
-
-            parts_of_speech = entry.get("parts_of_speech")
-            if parts_of_speech is None:
-                legacy_meanings = entry.get("meanings", [])
-                if not isinstance(legacy_meanings, list):
-                    raise ValueError(f"{word}: meanings は配列にしてください")
-                parts_of_speech = [{
-                    "part_of_speech": entry.get("part_of_speech", "不明"),
-                    "meanings": [
-                        {
-                            "meaning_ja": meaning,
-                            "synonyms": entry.get("synonyms", []),
-                            "antonyms": entry.get("antonyms", []),
-                        }
-                        if isinstance(meaning, str) else meaning
-                        for meaning in legacy_meanings
-                    ],
-                }]
-                legacy_format = True
-            else:
-                legacy_format = False
-            if not isinstance(parts_of_speech, list):
-                raise ValueError(f"{word}: parts_of_speech は配列にしてください")
-
-            for part in parts_of_speech:
-                if not isinstance(part, dict):
-                    raise ValueError(f"{word}: parts_of_speech の各要素はオブジェクトにしてください")
-                part_name = part.get("part_of_speech") or part.get("name")
-                meanings = part.get("meanings", [])
-                if not isinstance(part_name, str) or not part_name.strip():
-                    raise ValueError(f"{word}: 品詞名が必要です")
-                if not isinstance(meanings, list):
-                    raise ValueError(f"{word}/{part_name}: meanings は配列にしてください")
-
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO parts_of_speech(word_id, name) VALUES (?, ?)",
-                    (word_id, part_name.strip()),
-                )
-                part_id = self.connection.execute(
-                    "SELECT id FROM parts_of_speech WHERE word_id=? AND name=?",
-                    (word_id, part_name.strip()),
-                ).fetchone()[0]
-
-                for meaning in meanings:
-                    if isinstance(meaning, str):
-                        meaning = {"meaning_ja": meaning}
-                    if not isinstance(meaning, dict) or not isinstance(meaning.get("meaning_ja"), str):
-                        raise ValueError(f"{word}/{part_name}: meanings の各要素には meaning_ja が必要です")
-                    meaning_ja = meaning["meaning_ja"].strip()
-                    self.connection.execute(
-                        "INSERT OR IGNORE INTO meanings(part_of_speech_id, meaning_ja) VALUES (?, ?)",
-                        (part_id, meaning_ja),
-                    )
-                    meaning_id = self.connection.execute(
-                        "SELECT id FROM meanings WHERE part_of_speech_id=? AND meaning_ja=?",
-                        (part_id, meaning_ja),
-                    ).fetchone()[0]
-                    self._import_meaning_relations(meaning_id, meaning, language, source_id, part_name.strip())
-
-                    examples = meaning.get("examples", [])
-                    if not isinstance(examples, list):
-                        raise ValueError(f"{word}/{part_name}: examples は配列にしてください")
-                    for example in examples:
-                        self._insert_example(word, word_id, example)
-
-            examples = entry.get("examples", []) if legacy_format else []
-            if not isinstance(examples, list):
-                raise ValueError(f"{word}: examples は配列にしてください")
-            for example in examples:
-                self._insert_example(word, word_id, example)
-            imported += 1
+        try:
+            for entry in entries:
+                self._import_entry(entry)
+        except Exception:
+            self.connection.rollback()
+            raise
         self.connection.commit()
-        return imported
+        return len(entries)
 
-    def _insert_example(self, word: str, word_id: int, example: object) -> None:
+    def _import_entry(self, entry: dict) -> None:
+        # JSONの単語データを正とし、JSONから消えた意味・例文・関連はDBからも消す
+        word = entry.get("word")
+        if not isinstance(word, str) or not word.strip():
+            raise ValueError("各単語データには word が必要です")
+        word = word.strip()
+        language = entry.get("language", "English")
+        source = entry.get("source", "JSON")
+        if not isinstance(language, str) or not isinstance(source, str):
+            raise ValueError("language と source は文字列にしてください")
+
+        self.connection.execute("INSERT OR IGNORE INTO sources(name) VALUES (?)", (source,))
+        source_id = self.connection.execute("SELECT id FROM sources WHERE name=?", (source,)).fetchone()[0]
+        self.connection.execute(
+            """
+            INSERT INTO words (word, language, difficulty, source_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(word, language) DO UPDATE SET
+                difficulty=excluded.difficulty,
+                source_id=excluded.source_id
+            """,
+            (word, language, entry.get("difficulty"), source_id),
+        )
+        word_id = self.connection.execute("SELECT id FROM words WHERE word=? AND language=?", (word, language)).fetchone()[0]
+        self._clear_outgoing_links(word_id)
+        kept_part_ids: set[int] = set()
+        kept_meaning_ids: set[int] = set()
+        kept_sentences: set[str] = set()
+
+        parts_of_speech = entry.get("parts_of_speech")
+        if parts_of_speech is None:
+            legacy_meanings = entry.get("meanings", [])
+            if not isinstance(legacy_meanings, list):
+                raise ValueError(f"{word}: meanings は配列にしてください")
+            parts_of_speech = [{
+                "part_of_speech": entry.get("part_of_speech", "不明"),
+                "meanings": [
+                    {
+                        "meaning_ja": meaning,
+                        "synonyms": entry.get("synonyms", []),
+                        "antonyms": entry.get("antonyms", []),
+                    }
+                    if isinstance(meaning, str) else meaning
+                    for meaning in legacy_meanings
+                ],
+            }]
+            legacy_format = True
+        else:
+            legacy_format = False
+        if not isinstance(parts_of_speech, list):
+            raise ValueError(f"{word}: parts_of_speech は配列にしてください")
+
+        for part in parts_of_speech:
+            if not isinstance(part, dict):
+                raise ValueError(f"{word}: parts_of_speech の各要素はオブジェクトにしてください")
+            part_name = part.get("part_of_speech") or part.get("name")
+            meanings = part.get("meanings", [])
+            if not isinstance(part_name, str) or not part_name.strip():
+                raise ValueError(f"{word}: 品詞名が必要です")
+            if not isinstance(meanings, list):
+                raise ValueError(f"{word}/{part_name}: meanings は配列にしてください")
+            part_name = part_name.strip()
+            part_id = self._ensure_part_of_speech(word_id, part_name)
+            kept_part_ids.add(part_id)
+
+            for meaning in meanings:
+                if isinstance(meaning, str):
+                    meaning = {"meaning_ja": meaning}
+                if not isinstance(meaning, dict) or not isinstance(meaning.get("meaning_ja"), str):
+                    raise ValueError(f"{word}/{part_name}: meanings の各要素には meaning_ja が必要です")
+                meaning_id = self._ensure_meaning(part_id, meaning["meaning_ja"].strip())
+                kept_meaning_ids.add(meaning_id)
+                forms = {}
+                for key in FORM_KEYS:
+                    value = meaning.get(key)
+                    if value in (None, ""):
+                        continue
+                    if not isinstance(value, str):
+                        raise ValueError(f"{word}/{part_name}: {key} は文字列にしてください")
+                    forms[key] = value.strip()
+                if forms.get("gender") not in (None, *GENDERS):
+                    raise ValueError(f"{word}/{part_name}: gender は {'/'.join(GENDERS)} のいずれかにしてください")
+                self.connection.execute(
+                    "UPDATE meanings SET forms=? WHERE id=?",
+                    (json.dumps(forms, ensure_ascii=False) if forms else None, meaning_id),
+                )
+                self._import_meaning_relations(meaning_id, meaning, language, source_id, part_name)
+
+                examples = meaning.get("examples", [])
+                if not isinstance(examples, list):
+                    raise ValueError(f"{word}/{part_name}: examples は配列にしてください")
+                for example in examples:
+                    kept_sentences.add(self._insert_example(word, word_id, example, meaning_id))
+
+        examples = entry.get("examples", []) if legacy_format else []
+        if not isinstance(examples, list):
+            raise ValueError(f"{word}: examples は配列にしてください")
+        for example in examples:
+            kept_sentences.add(self._insert_example(word, word_id, example))
+
+        for derivative in normalize_derivatives(entry):
+            derived_word_id, _ = self._ensure_word_meaning(
+                derivative["word"], language, source_id, derivative["part_of_speech"], derivative.get("meaning_ja")
+            )
+            if derived_word_id != word_id:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO derivations(word_id, derived_word_id, part_of_speech) VALUES (?, ?, ?)",
+                    (word_id, derived_word_id, derivative["part_of_speech"]),
+                )
+        self._prune_word(word_id, kept_part_ids, kept_meaning_ids, kept_sentences)
+
+    def _clear_outgoing_links(self, word_id: int) -> None:
+        self.connection.execute(
+            """
+            DELETE FROM meaning_relations WHERE meaning_id IN (
+                SELECT m.id FROM meanings m JOIN parts_of_speech p ON p.id = m.part_of_speech_id WHERE p.word_id=?
+            )
+            """,
+            (word_id,),
+        )
+        self.connection.execute("DELETE FROM derivations WHERE word_id=?", (word_id,))
+
+    def _prune_word(self, word_id: int, part_ids: set[int], meaning_ids: set[int], sentences: set[str]) -> None:
+        # 他の単語の類義語・対義語として参照されている意味は残す
+        self.connection.execute(
+            f"""
+            DELETE FROM meanings
+            WHERE part_of_speech_id IN (SELECT id FROM parts_of_speech WHERE word_id=?)
+              AND id NOT IN ({", ".join("?" for _ in meaning_ids)})
+              AND id NOT IN (SELECT related_meaning_id FROM meaning_relations)
+            """,
+            (word_id, *meaning_ids),
+        )
+        self.connection.execute(
+            f"""
+            DELETE FROM parts_of_speech
+            WHERE word_id=? AND id NOT IN ({", ".join("?" for _ in part_ids)})
+              AND NOT EXISTS (SELECT 1 FROM meanings WHERE part_of_speech_id = parts_of_speech.id)
+            """,
+            (word_id, *part_ids),
+        )
+        self.connection.execute(
+            f"DELETE FROM examples WHERE word_id=? AND sentence NOT IN ({', '.join('?' for _ in sentences)})",
+            (word_id, *sentences),
+        )
+
+    def _insert_example(self, word: str, word_id: int, example: object, meaning_id: int | None = None) -> str:
         if not isinstance(example, dict) or not isinstance(example.get("sentence"), str):
             raise ValueError(f"{word}: examples の各要素には sentence が必要です")
+        targets = example.get("targets")
+        if targets is not None and (not isinstance(targets, list) or not all(isinstance(target, str) and target for target in targets)):
+            raise ValueError(f"{word}: targets は文字列の配列にしてください")
+        sentence = example["sentence"].strip()
         self.connection.execute(
-            "INSERT OR IGNORE INTO examples(word_id, sentence, translation_ja) VALUES (?, ?, ?)",
-            (word_id, example["sentence"].strip(), example.get("translation_ja")),
+            """
+            INSERT INTO examples(word_id, sentence, translation_ja, targets, meaning_id) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(word_id, sentence) DO UPDATE SET
+                translation_ja=excluded.translation_ja, targets=excluded.targets, meaning_id=excluded.meaning_id
+            """,
+            (word_id, sentence, example.get("translation_ja"), json.dumps(targets, ensure_ascii=False) if targets else None, meaning_id),
         )
+        return sentence
+
+    def _ensure_part_of_speech(self, word_id: int, name: str) -> int:
+        self.connection.execute("INSERT OR IGNORE INTO parts_of_speech(word_id, name) VALUES (?, ?)", (word_id, name))
+        return self.connection.execute("SELECT id FROM parts_of_speech WHERE word_id=? AND name=?", (word_id, name)).fetchone()[0]
+
+    def _ensure_meaning(self, part_id: int, meaning_ja: str) -> int:
+        self.connection.execute("INSERT OR IGNORE INTO meanings(part_of_speech_id, meaning_ja) VALUES (?, ?)", (part_id, meaning_ja))
+        return self.connection.execute(
+            "SELECT id FROM meanings WHERE part_of_speech_id=? AND meaning_ja=?", (part_id, meaning_ja)
+        ).fetchone()[0]
+
+    def _ensure_word_meaning(
+        self, word: str, language: str, source_id: int, part_of_speech: str, meaning_ja: str | None
+    ) -> tuple[int, int | None]:
+        self.connection.execute("INSERT OR IGNORE INTO words (word, language, source_id) VALUES (?, ?, ?)", (word, language, source_id))
+        word_id = self.connection.execute("SELECT id FROM words WHERE word=? AND language=?", (word, language)).fetchone()[0]
+        part_id = self._ensure_part_of_speech(word_id, part_of_speech)
+        return word_id, self._ensure_meaning(part_id, meaning_ja) if meaning_ja else None
 
     def _import_meaning_relations(
         self,
@@ -291,29 +482,9 @@ class LexiconDatabase:
                     raise ValueError(f"{relation_type} には word が必要です")
                 if not isinstance(related_meaning, str) or not related_meaning.strip():
                     raise ValueError(f"{related_word}: 関連する意味には meaning_ja が必要です")
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO words (word, language, source_id) VALUES (?, ?, ?)",
-                    (related_word.strip(), language, source_id),
+                _, related_meaning_id = self._ensure_word_meaning(
+                    related_word.strip(), language, source_id, related_pos, related_meaning.strip()
                 )
-                related_word_id = self.connection.execute(
-                    "SELECT id FROM words WHERE word=? AND language=?", (related_word.strip(), language)
-                ).fetchone()[0]
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO parts_of_speech(word_id, name) VALUES (?, ?)",
-                    (related_word_id, related_pos),
-                )
-                related_pos_id = self.connection.execute(
-                    "SELECT id FROM parts_of_speech WHERE word_id=? AND name=?",
-                    (related_word_id, related_pos),
-                ).fetchone()[0]
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO meanings(part_of_speech_id, meaning_ja) VALUES (?, ?)",
-                    (related_pos_id, related_meaning.strip()),
-                )
-                related_meaning_id = self.connection.execute(
-                    "SELECT id FROM meanings WHERE part_of_speech_id=? AND meaning_ja=?",
-                    (related_pos_id, related_meaning.strip()),
-                ).fetchone()[0]
                 self.connection.execute(
                     "INSERT OR IGNORE INTO meaning_relations(meaning_id, related_meaning_id, relation_type) VALUES (?, ?, ?)",
                     (meaning_id, related_meaning_id, relation_type[:-1]),
@@ -339,36 +510,125 @@ class LexiconDatabase:
             JOIN meanings related_meaning ON related_meaning.id = mr.related_meaning_id
             JOIN parts_of_speech related_pos ON related_pos.id = related_meaning.part_of_speech_id
             WHERE related_pos.word_id=?
+            UNION
+            SELECT derived_word_id FROM derivations WHERE word_id=?
+            UNION
+            SELECT word_id FROM derivations WHERE derived_word_id=?
             """,
-            (word_id, word_id),
+            (word_id, word_id, word_id, word_id),
         ).fetchall()
         return tuple(row[0] for row in rows)
 
     def _choice_exclusion_ids(self, word_id: int) -> tuple[int, ...]:
         return (word_id, *self._related_word_ids(word_id))
 
-    def _choice_candidates(self, column: str, excluded_ids: tuple[int, ...], part_of_speech: str, answer: str) -> list[str]:
-        # 同じ品詞の候補を優先し、足りない場合のみ他の品詞で補う
+    def _choice_candidates(
+        self, column: str, excluded_ids: tuple[int, ...], part_of_speech: str, answer: str, language: str, answer_word_id: int,
+        required_part_of_speech: str | None = None,
+    ) -> list[str]:
+        # 同じ言語・同じ品詞の候補を優先し、足りない場合のみ他の品詞で補う
         placeholders = ", ".join("?" for _ in excluded_ids)
         rows = self.connection.execute(
             f"""
-            SELECT {column}
+            SELECT {column} AS choice, MIN(w.id) AS word_id, GROUP_CONCAT(m.meaning_ja, char(31)) AS meanings
             FROM words w
             JOIN parts_of_speech p ON p.word_id = w.id
             JOIN meanings m ON m.part_of_speech_id = p.id
-            WHERE w.id NOT IN ({placeholders}) AND {column} != ? AND {HAS_REAL_MEANING}
+            WHERE w.id NOT IN ({placeholders}) AND {column} != ? AND {HAS_REAL_MEANING} AND w.language = ?
+              AND (? IS NULL OR p.name = ?)
             GROUP BY {column}
             ORDER BY MAX(p.name = ?) DESC, RANDOM()
-            LIMIT 3
+            LIMIT ?
             """,
-            (*excluded_ids, answer, part_of_speech),
+            (*excluded_ids, answer, language, required_part_of_speech, required_part_of_speech, part_of_speech, CHOICE_POOL_SIZE),
+        ).fetchall()
+
+        # 正解や他の選択肢とほぼ同じ意味の候補 (辛辣な / 辛らつな など) は、正解が複数になったり
+        # 消去法で答えが分かったりするので避ける。互いに類義語・派生語の関係にある候補も避ける
+        picked: list[sqlite3.Row] = []
+        used_meanings = self._word_meanings(answer_word_id)
+        related_ids: set[int] = set()
+        for row in rows:
+            meanings = row["meanings"].split(MEANING_SEPARATOR)
+            if row["word_id"] in related_ids or any(meanings_similar(meaning, used) for meaning in meanings for used in used_meanings):
+                continue
+            picked.append(row)
+            used_meanings += meanings
+            related_ids.update(self._related_word_ids(row["word_id"]))
+            if len(picked) == 3:
+                break
+        # 候補が少なくて足りないときは、条件を外して残りから補う
+        for row in rows:
+            if len(picked) == 3:
+                break
+            if row not in picked:
+                picked.append(row)
+        return [row["choice"] for row in picked]
+
+    def _word_meanings(self, word_id: int) -> list[str]:
+        rows = self.connection.execute(
+            "SELECT m.meaning_ja FROM parts_of_speech p JOIN meanings m ON m.part_of_speech_id = p.id WHERE p.word_id=?",
+            (word_id,),
         ).fetchall()
         return [row[0] for row in rows]
 
-    def _weighted_word(self, question_type: str, join: str = "", where: str = "1") -> sqlite3.Row:
+    def _derivative_candidates(self, base: sqlite3.Row, answer: str, part_of_speech: str) -> list[str]:
+        # 元の単語や別品詞の派生語を優先し、同じ品詞の派生語は正解が複数になるので除外する
+        rows = self.connection.execute(
+            """
+            SELECT w.word
+            FROM words w
+            JOIN parts_of_speech p ON p.word_id = w.id
+            LEFT JOIN derivations d ON d.word_id = ? AND d.derived_word_id = w.id
+            WHERE w.language = ? AND w.word != ?
+              AND (d.part_of_speech IS NULL OR d.part_of_speech != ?)
+            GROUP BY w.word
+            ORDER BY MAX(w.id = ? OR d.word_id IS NOT NULL) DESC, MAX(p.name = ?) DESC, RANDOM()
+            LIMIT 3
+            """,
+            (base["id"], base["language"], answer, part_of_speech, base["id"], part_of_speech),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def _cloze_sentences(self, language: str | None) -> dict[int, list[ClozeSentence]]:
+        """穴埋めに使える例文を単語ごとに返す"""
+        rows = self.connection.execute(
+            """
+            SELECT e.word_id, e.sentence, e.targets, e.meaning_id, w.word, w.language,
+                (SELECT GROUP_CONCAT(m.forms, char(31))
+                 FROM parts_of_speech p JOIN meanings m ON m.part_of_speech_id = p.id
+                 WHERE p.word_id = w.id AND m.forms IS NOT NULL) AS forms
+            FROM examples e
+            JOIN words w ON w.id = e.word_id
+            WHERE ? IS NULL OR w.language = ?
+            """,
+            (language, language),
+        ).fetchall()
+        sentences: dict[int, list[ClozeSentence]] = {}
+        for row in rows:
+            targets = json.loads(row["targets"]) if row["targets"] else None
+            # 登録された複数形・活用形 (gemacht など) も穴にする語として使う
+            language_spec = get_language(row["language"])
+            extra_forms = [
+                form for forms in (row["forms"].split("\x1f") if row["forms"] else ())
+                for form in language_spec.cloze_forms(json.loads(forms))
+            ]
+            spans = find_cloze_spans(row["sentence"], row["word"], row["language"], targets, extra_forms)
+            if not spans:
+                continue
+            start, end = spans[0]
+            surface = row["sentence"][start:end]
+            form = None
+            if len(spans) == 1 and language_spec.classify_form:
+                form = language_spec.classify_form(row["word"], surface, row["sentence"][:start])
+            sentences.setdefault(row["word_id"], []).append(ClozeSentence(blank_out(row["sentence"], spans), form, surface, row["meaning_id"]))
+        return sentences
+
+    def _weighted_word(self, question_type: str, scope: QuizScope, join: str = "", where: str = "1") -> sqlite3.Row:
+        scope_condition, scope_params = scope.condition()
         rows = self.connection.execute(
             f"""
-            SELECT w.id, w.word, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja,
+            SELECT w.id, w.word, w.language, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms,
                 COALESCE((
                     SELECT AVG(CASE WHEN recent.is_correct = 0 THEN 1.0 ELSE 0.0 END)
                     FROM (
@@ -383,41 +643,101 @@ class LexiconDatabase:
             JOIN parts_of_speech p ON p.word_id = w.id
             JOIN meanings m ON m.part_of_speech_id = p.id
             {join}
-            WHERE {where}
+            WHERE {where} AND {scope_condition}
             GROUP BY w.id, m.id
             ORDER BY RANDOM()
             """,
-            (question_type, RECENT_HISTORY_LIMIT),
+            (question_type, RECENT_HISTORY_LIMIT, *scope_params),
         ).fetchall()
         if not rows:
-            raise ValueError("問題を作れる単語データがありません")
+            raise ValueError("出題範囲の条件に合う単語データがありません")
         return random.choices(rows, weights=[1.0 + 5.0 * row["incorrect_rate"] for row in rows], k=1)[0]
 
-    def create_question(self, question_type: str, show_hint: bool = False) -> Question:
+    def languages(self) -> list[str]:
+        """登録されている言語を単語数の多い順に返す"""
+        rows = self.connection.execute("SELECT language FROM words GROUP BY language ORDER BY COUNT(*) DESC, language").fetchall()
+        return [row[0] for row in rows]
+
+    def scope_options(self, language: str) -> tuple[list[str], list[str]]:
+        """その言語で選べる出典とレベルを返す"""
+        sources = self.connection.execute(
+            "SELECT DISTINCT s.name FROM words w JOIN sources s ON s.id = w.source_id WHERE w.language=? ORDER BY s.name", (language,)
+        ).fetchall()
+        difficulties = self.connection.execute(
+            "SELECT DISTINCT difficulty FROM words WHERE language=? AND difficulty IS NOT NULL AND difficulty != '' ORDER BY difficulty",
+            (language,),
+        ).fetchall()
+        return [row[0] for row in sources], [row[0] for row in difficulties]
+
+    def create_question(self, question_type: str, show_hint: bool = False, scope: QuizScope | None = None) -> Question:
+        scope = scope or QuizScope()
+        language = scope.language
         if question_type == "english_to_japanese":
-            target = self._weighted_word(question_type, where=HAS_REAL_MEANING)
+            target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
             excluded_ids = self._choice_exclusion_ids(target["id"])
-            choices = [target["meaning_ja"], *self._choice_candidates("m.meaning_ja", excluded_ids, target["part_of_speech"], target["meaning_ja"])]
+            choices = [target["meaning_ja"], *self._choice_candidates("m.meaning_ja", excluded_ids, target["part_of_speech"], target["meaning_ja"], target["language"], target["id"])]
             random.shuffle(choices)
-            return Question(target["id"], question_type, target["word"], choices, target["meaning_ja"])
+            prompt = get_language(target["language"]).headword(target["word"], json.loads(target["forms"] or "{}"))
+            return Question(target["id"], question_type, prompt, choices, target["meaning_ja"])
         if question_type == "japanese_to_english":
-            target = self._weighted_word(question_type, where=HAS_REAL_MEANING)
+            target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
             excluded_ids = self._choice_exclusion_ids(target["id"])
-            choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"])]
+            choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"], target["language"], target["id"])]
             random.shuffle(choices)
             return Question(target["id"], question_type, target["meaning_ja"], choices, target["word"])
         if question_type == "cloze":
-            target = self._weighted_word(question_type, "JOIN examples e ON e.word_id=w.id", HAS_REAL_MEANING)
-            sentence = self.connection.execute("SELECT sentence FROM examples WHERE word_id=? ORDER BY RANDOM() LIMIT 1", (target["id"],)).fetchone()[0]
-            prompt = sentence.replace(target["word"], "_____")
+            sentences = self._cloze_sentences(language)
+            if not sentences:
+                raise ValueError("穴埋めに使える例文がありません")
+            # 例文が属する意味を出題対象にし、品詞 (誤答の候補) とヒントをその意味に合わせる。
+            # vent の動詞の例文で、名詞「通気孔」の品詞やヒントが使われないようにするため
+            meaning_ids = {item.meaning_id for items in sentences.values() for item in items if item.meaning_id is not None}
+            unlinked_word_ids = {word_id for word_id, items in sentences.items() if any(item.meaning_id is None for item in items)}
+            target = self._weighted_word(
+                question_type, scope,
+                where=f"{HAS_REAL_MEANING} AND (m.id IN ({', '.join(map(str, meaning_ids)) or 'NULL'})"
+                      f" OR w.id IN ({', '.join(map(str, unlinked_word_ids)) or 'NULL'}))",
+            )
+            prompt, form, surface, _ = random.choice([
+                item for item in sentences[target["id"]] if item.meaning_id in (None, target["meaning_id"])
+            ])
             if show_hint:
                 prompt += f"\nヒント: {target['meaning_ja']}"
             excluded_ids = self._choice_exclusion_ids(target["id"])
-            choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"])]
+            language_spec = get_language(target["language"])
+            if form in (None, "base") or language_spec.inflect_to is None:
+                choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"], target["language"], target["id"])]
+                random.shuffle(choices)
+                return Question(target["id"], question_type, prompt, choices, target["word"])
+
+            # 穴の語が活用形 (petrified など) なら、選択肢も同じ形にそろえる。過去形などは動詞だけから選ぶ
+            required_part_of_speech = language_spec.form_parts_of_speech.get(form)
+            candidates = self._choice_candidates(
+                "w.word", excluded_ids, required_part_of_speech or target["part_of_speech"], target["word"], target["language"], target["id"],
+                required_part_of_speech,
+            )
+            answer = surface.lower()
+            choices = [answer]
+            for candidate in candidates:
+                inflected = language_spec.inflect_to(candidate, form)
+                if inflected not in choices:
+                    choices.append(inflected)
             random.shuffle(choices)
-            return Question(target["id"], question_type, prompt, choices, target["word"])
+            return Question(target["id"], question_type, prompt, choices, answer, f"{answer} ({target['word']})")
         if question_type == "relation":
-            relation = self.connection.execute("SELECT * FROM meaning_relations ORDER BY RANDOM() LIMIT 1").fetchone()
+            scope_condition, scope_params = scope.condition()
+            relation = self.connection.execute(
+                f"""
+                SELECT mr.*
+                FROM meaning_relations mr
+                JOIN meanings m ON m.id = mr.meaning_id
+                JOIN parts_of_speech p ON p.id = m.part_of_speech_id
+                JOIN words w ON w.id = p.word_id
+                WHERE {scope_condition}
+                ORDER BY RANDOM() LIMIT 1
+                """,
+                scope_params,
+            ).fetchone()
             if not relation:
                 raise ValueError("類義語・対義語データがありません")
             target = self.connection.execute(
@@ -432,7 +752,7 @@ class LexiconDatabase:
             ).fetchone()
             related_row = self.connection.execute(
                 """
-                SELECT w.id, w.word, p.name AS part_of_speech
+                SELECT w.id, w.word, w.language, p.name AS part_of_speech
                 FROM meanings m
                 JOIN parts_of_speech p ON p.id = m.part_of_speech_id
                 JOIN words w ON w.id = p.word_id
@@ -441,10 +761,25 @@ class LexiconDatabase:
                 (relation["related_meaning_id"],),
             ).fetchone()
             related = related_row["word"]
-            choices = [related, *self._choice_candidates("w.word", (target["id"], related_row["id"]), related_row["part_of_speech"], related)]
+            choices = [related, *self._choice_candidates("w.word", (target["id"], related_row["id"]), related_row["part_of_speech"], related, related_row["language"], related_row["id"])]
             random.shuffle(choices)
             label = "類義語" if relation["relation_type"] == "synonym" else "対義語"
             return Question(target["id"], question_type, f"{target['word']} の{label}は?", choices, related)
+        if question_type == "derivative":
+            target = self._weighted_word(question_type, scope, "JOIN derivations d ON d.word_id = w.id", HAS_REAL_MEANING)
+            derivation = self.connection.execute(
+                """
+                SELECT w.word, d.part_of_speech
+                FROM derivations d JOIN words w ON w.id = d.derived_word_id
+                WHERE d.word_id=? ORDER BY RANDOM() LIMIT 1
+                """,
+                (target["id"],),
+            ).fetchone()
+            answer = derivation["word"]
+            choices = [answer, *self._derivative_candidates(target, answer, derivation["part_of_speech"])]
+            random.shuffle(choices)
+            prompt = f"{target['word']} ({target['part_of_speech']}) の{derivation['part_of_speech']}形は?"
+            return Question(target["id"], question_type, prompt, choices, answer)
         raise ValueError(f"未対応の問題形式です: {question_type}")
 
     def record_answer(self, question: Question, selected_answer: str) -> bool:
@@ -453,8 +788,19 @@ class LexiconDatabase:
         self.connection.commit()
         return correct
 
-    def recent_accuracy(self, question_type: str | None = None, limit: int = 10) -> tuple[int, int, float]:
-        condition = "WHERE question_type=?" if question_type else ""
-        params = (question_type, limit) if question_type else (limit,)
-        row = self.connection.execute(f"SELECT COUNT(*) total, COALESCE(SUM(is_correct),0) correct FROM (SELECT is_correct FROM answer_history {condition} ORDER BY id DESC LIMIT ?)", params).fetchone()
+    def recent_accuracy(self, question_type: str | None = None, limit: int = 10, language: str | None = None) -> tuple[int, int, float]:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) total, COALESCE(SUM(is_correct), 0) correct
+            FROM (
+                SELECT h.is_correct
+                FROM answer_history h
+                JOIN words w ON w.id = h.word_id
+                WHERE (? IS NULL OR h.question_type = ?) AND (? IS NULL OR w.language = ?)
+                ORDER BY h.id DESC
+                LIMIT ?
+            )
+            """,
+            (question_type, question_type, language, language, limit),
+        ).fetchone()
         return row["total"], row["correct"], (row["correct"] / row["total"] * 100 if row["total"] else 0.0)
