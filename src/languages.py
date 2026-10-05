@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import english
+import german
+import korean
 
 
 VOWELS = "aeiou"
@@ -70,6 +72,22 @@ class Language:
     inflect_to: Callable[[str, str], str] | None = None
     # その形にできる品詞 (過去形なら動詞だけ)。ここにない形は出題語と同じ品詞から選ぶ
     form_parts_of_speech: dict[str, str] = field(default_factory=dict)
+    # ラテン文字転写テスト。romanize(見出し語) → 正しい転写 (転写できなければ None)、
+    # romanization_distractors(見出し語, 正しい転写) → 誤答。None ならその言語では出題しない
+    romanize: Callable[[str], str | None] | None = None
+    romanization_distractors: Callable[[str, str], list[str]] | None = None
+    # 複数形クイズの誤答。plural_distractors(単数形, 正しい複数形) → 誤答。None ならその言語では出題しない
+    plural_distractors: Callable[[str, str], list[str]] | None = None
+
+    def supports(self, question_type: str) -> bool:
+        """言語固有の問題形式 (転写・性・複数形) を出題できるか"""
+        if question_type == "romanization":
+            return self.romanize is not None
+        if question_type == "gender":
+            return bool(self.articles)
+        if question_type == "plural":
+            return self.plural_distractors is not None
+        return True
 
     @property
     def label(self) -> str:
@@ -137,8 +155,17 @@ GERMAN = Language(
         ),
     },
     inflect=_german_forms,
+    plural_distractors=german.plural_distractors,
 )
-LANGUAGES = (ENGLISH, GERMAN)
+KOREAN = Language(
+    "Korean",
+    ("한국어", "韓国語"),
+    "韓",
+    parts_of_speech=("名詞", "代名詞", "数詞", "動詞", "形容詞", "存在詞", "副詞", "冠形詞", "感動詞", "接続詞", "熟語"),
+    romanize=korean.romanize,
+    romanization_distractors=korean.romanization_distractors,
+)
+LANGUAGES = (ENGLISH, GERMAN, KOREAN)
 GENDERS = tuple(GENDER_NAMES)
 # どの言語でも語形として扱うキー。エディタではこれらを意味の編集対象として扱う
 FORM_KEYS = tuple(dict.fromkeys(form_field.key for language in LANGUAGES for form_field in language.all_form_fields))

@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from database import LexiconDatabase, QuizScope
 from languages import get_language
+from word_editor import WordEditor
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon.db"
@@ -16,14 +17,23 @@ DEFAULT_SAMPLE_JSON_PATH = Path(__file__).resolve().parent.parent / "samples" / 
 MATERIALS_DIR = Path(__file__).resolve().parent.parent / "materials"
 # 問題形式のIDは回答履歴に保存されるため変えない。表示名の {lang} は選んだ言語の略称 (英・独など) になる
 SKIPPED_ANSWER = "(スキップ)"
-ALL_LABEL = "すべて"
+SCOPE_LIST_HEIGHT = 4
 QUESTION_TYPES = [
     ("{lang}→日", "english_to_japanese"),
     ("日→{lang}", "japanese_to_english"),
     ("例文穴埋め", "cloze"),
     ("類義語・対義語", "relation"),
     ("派生語", "derivative"),
+    ("ラテン文字転写", "romanization"),
+    ("性 (冠詞)", "gender"),
+    ("複数形", "plural"),
 ]
+
+
+def available_question_types(language: str) -> list[str]:
+    # 転写・性・複数形などの問題形式は、対応した言語 (韓国語・ドイツ語など) のときだけ選べる
+    language_spec = get_language(language)
+    return [value for _, value in QUESTION_TYPES if language_spec.supports(value)]
 
 
 def question_label(question_type: str, language: str) -> str:
@@ -49,6 +59,7 @@ class QuizApp(tk.Tk):
         self.show_hint = False
         self.answer_var = tk.IntVar(value=-1)
         self.answering = False
+        self.editor: WordEditor | None = None
 
         self.columnconfigure(0, weight=1)
         self._build_db_frame()
@@ -68,8 +79,9 @@ class QuizApp(tk.Tk):
         ttk.Button(frame, text="開く", command=lambda: self.open_database(Path(self.db_path_var.get()))).grid(row=0, column=2, padx=5)
         ttk.Button(frame, text="JSON取り込み", command=self.import_json).grid(row=0, column=3, padx=5)
         ttk.Button(frame, text="フォルダ取り込み", command=self.import_folder).grid(row=0, column=4, padx=5)
+        ttk.Button(frame, text="単語編集", command=self.open_editor).grid(row=0, column=5, padx=5)
         self.db_status_var = tk.StringVar(value="未接続")
-        ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w", padx=5, pady=(0, 5))
+        ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=6, sticky="w", padx=5, pady=(0, 5))
 
     def _build_setup_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="クイズ設定")
@@ -83,15 +95,11 @@ class QuizApp(tk.Tk):
         self.language_box.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         self.language_box.bind("<<ComboboxSelected>>", lambda event: self._on_language_selected())
 
-        ttk.Label(frame, text="出典").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.source_var = tk.StringVar(value=ALL_LABEL)
-        self.source_box = ttk.Combobox(frame, textvariable=self.source_var, state="readonly")
-        self.source_box.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-
-        ttk.Label(frame, text="レベル").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        self.difficulty_var = tk.StringVar(value=ALL_LABEL)
-        self.difficulty_box = ttk.Combobox(frame, textvariable=self.difficulty_var, state="readonly")
-        self.difficulty_box.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+        # 出典・レベルは複数選択できる。何も選ばなければすべてが対象
+        ttk.Label(frame, text="出典\n(未選択=すべて)").grid(row=1, column=0, sticky="nw", padx=5, pady=5)
+        self.source_list = self._scope_list(frame, 1)
+        ttk.Label(frame, text="レベル\n(未選択=すべて)").grid(row=2, column=0, sticky="nw", padx=5, pady=5)
+        self.difficulty_list = self._scope_list(frame, 2)
 
         ttk.Label(frame, text="問題形式").grid(row=3, column=0, sticky="w", padx=5, pady=5)
         self.type_var = tk.StringVar()
@@ -112,6 +120,21 @@ class QuizApp(tk.Tk):
         self.start_button.grid(row=6, column=1, sticky="e", padx=5, pady=(0, 5))
         self._refresh_type_labels()
 
+    def _scope_list(self, parent: ttk.Frame, row: int) -> tk.Listbox:
+        container = ttk.Frame(parent)
+        container.grid(row=row, column=1, sticky="ew", padx=5, pady=5)
+        container.columnconfigure(0, weight=1)
+        listbox = tk.Listbox(container, selectmode="multiple", exportselection=False, height=SCOPE_LIST_HEIGHT)
+        listbox.grid(row=0, column=0, sticky="ew")
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        listbox.configure(yscrollcommand=scrollbar.set)
+        return listbox
+
+    @staticmethod
+    def _selected_items(listbox: tk.Listbox) -> tuple[str, ...]:
+        return tuple(listbox.get(index) for index in listbox.curselection())
+
     def _refresh_languages(self) -> None:
         # DBに登録されている言語から選ぶ。取り込みで言語が増えたときも選択中の言語は保つ
         languages = self.database.languages() if self.database else []
@@ -121,23 +144,30 @@ class QuizApp(tk.Tk):
         self._on_language_selected()
 
     def _on_language_selected(self) -> None:
-        # 出典・レベルの候補は選んだ言語に登録されているものだけにする。選択中の値がなくなったら「すべて」に戻す
+        # 出典・レベルの候補は選んだ言語に登録されているものだけにする。候補に残った値は選択を保つ
         sources, difficulties = self.database.scope_options(self.language_var.get()) if self.database else ([], [])
-        for box, variable, values in ((self.source_box, self.source_var, sources), (self.difficulty_box, self.difficulty_var, difficulties)):
-            box.configure(values=[ALL_LABEL, *values])
-            if variable.get() not in values:
-                variable.set(ALL_LABEL)
+        for listbox, values in ((self.source_list, sources), (self.difficulty_list, difficulties)):
+            selected = self._selected_items(listbox)
+            listbox.delete(0, "end")
+            for index, value in enumerate(values):
+                listbox.insert("end", value)
+                if value in selected:
+                    listbox.selection_set(index)
         self._refresh_type_labels()
 
     def _scope(self) -> QuizScope:
-        def selected(variable: tk.StringVar) -> str | None:
-            return None if variable.get() == ALL_LABEL else variable.get()
-        return QuizScope(self.language_var.get(), selected(self.source_var), selected(self.difficulty_var))
+        return QuizScope(self.language_var.get(), self._selected_items(self.source_list), self._selected_items(self.difficulty_list))
 
     def _refresh_type_labels(self) -> None:
         selected = self._selected_type() if self.type_var.get() else QUESTION_TYPES[0][1]
-        self.type_box.configure(values=[question_label(value, self.language_var.get()) for _, value in QUESTION_TYPES])
+        self.type_values = available_question_types(self.language_var.get())
+        fell_back = selected not in self.type_values
+        if fell_back:
+            selected = self.type_values[0]
+        self.type_box.configure(values=[question_label(value, self.language_var.get()) for value in self.type_values])
         self.type_var.set(question_label(selected, self.language_var.get()))
+        if fell_back:
+            self._on_type_selected()
 
     def _on_type_selected(self, event: object = None) -> None:
         is_cloze = self._selected_type() == "cloze"
@@ -147,7 +177,7 @@ class QuizApp(tk.Tk):
 
     def _selected_type(self) -> str:
         # 表示名は言語で変わるため、選択肢の位置で問題形式を判定する
-        return QUESTION_TYPES[self.type_box.current()][1]
+        return self.type_values[self.type_box.current()]
 
     def _build_quiz_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="問題")
@@ -225,6 +255,8 @@ class QuizApp(tk.Tk):
         flag = "!disabled" if enabled else "disabled"
         for child in self.setup_frame.winfo_children():
             child.state([flag])
+        for listbox in (self.source_list, self.difficulty_list):
+            listbox.configure(state="normal" if enabled else "disabled")
         self._on_type_selected()
 
     def choose_db(self) -> None:
@@ -290,6 +322,24 @@ class QuizApp(tk.Tk):
             messagebox.showerror("一部の取り込みに失敗しました", message + "\n\n" + "\n".join(errors))
         else:
             messagebox.showinfo("取り込み完了", message)
+
+    def open_editor(self) -> None:
+        # エディタは1つだけ開く。既に開いていれば前面に出す
+        if self.editor is not None and self.editor.winfo_exists():
+            self.editor.deiconify()
+            self.editor.lift()
+            self.editor.focus_set()
+            return
+        self.editor = WordEditor(self, on_close=self._on_editor_closed)
+
+    def _on_editor_closed(self, saved_paths: set[Path]) -> None:
+        # エディタはJSONだけを書き換えるので、保存したファイルをDBに取り込むか確認する
+        self.editor = None
+        if not saved_paths or self.database is None:
+            return
+        names = "\n".join(sorted(path.name for path in saved_paths))
+        if messagebox.askyesno("DBに取り込む", f"編集したJSONをDBに取り込みますか?\n\n{names}", parent=self):
+            self._import_files(sorted(saved_paths))
 
     def start_quiz(self) -> None:
         if self.database is None:
@@ -378,6 +428,10 @@ class QuizApp(tk.Tk):
             )
 
     def on_close(self) -> None:
+        if self.editor is not None and self.editor.winfo_exists():
+            if not self.editor.confirm_discard():
+                return
+            self.editor.destroy()
         if self.database is not None:
             self.database.close()
         self.destroy()

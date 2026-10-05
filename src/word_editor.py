@@ -5,6 +5,8 @@ import json
 import re
 import sys
 import tkinter as tk
+from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -115,15 +117,17 @@ def _merge_meaning(existing: dict, meaning: dict) -> None:
             existing.setdefault("examples", []).append(example)
 
 
+def entry_key(entry: dict) -> tuple[str, str, str, str]:
+    """見出しの同一性。同じ単語でも出典やレベルが違えば別見出し (A1 の接続詞 aber と A2 の心態詞 aber など)"""
+    return entry.get("word"), entry.get("language", "English"), entry.get("source") or "", entry.get("difficulty") or ""
+
+
 def merge_entry(entries: list[dict], entry: dict) -> bool:
-    """同じ単語・言語があれば品詞と意味を追記し、なければ末尾に追加する。追記した場合は True。"""
-    existing = next((item for item in entries if item.get("word") == entry["word"] and item.get("language", "English") == entry["language"]), None)
+    """同じ見出しがあれば品詞と意味を追記し、なければ末尾に追加する。追記した場合は True。"""
+    existing = next((item for item in entries if entry_key(item) == entry_key(entry)), None)
     if existing is None:
         entries.append(entry)
         return False
-    for key in ("difficulty", "source"):
-        if entry.get(key):
-            existing[key] = entry[key]
     parts = existing.setdefault("parts_of_speech", [])
     for part in entry["parts_of_speech"]:
         existing_part = next((item for item in parts if item.get("part_of_speech") == part["part_of_speech"]), None)
@@ -187,9 +191,9 @@ def save_entries(path: Path, entries: list[dict]) -> None:
     temporary_path.replace(path)
 
 
-class WordEditor(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
+class WordEditor(tk.Toplevel):
+    def __init__(self, master: tk.Misc, on_close: Callable[[set[Path]], None] | None = None) -> None:
+        super().__init__(master)
         self.title("LexiconEngine 単語エディタ")
         self.geometry("1100x800")
         self.entries: list[dict] = []
@@ -200,6 +204,10 @@ class WordEditor(tk.Tk):
         self.pending_parts: list[tuple[str, dict]] = []
         self.editing_meaning: int | None = None
         self.dirty = False
+        # このウィンドウで保存したJSON。クイズ画面から開いたときは閉じるときにDBへの取り込みを勧める
+        self.saved_paths: set[Path] = set()
+        self.on_close = on_close
+        self.protocol("WM_DELETE_WINDOW", self.close)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(3, weight=1)
 
@@ -378,23 +386,30 @@ class WordEditor(tk.Tk):
             or (self.current_index is None and bool(self.word_var.get().strip()))
         )
 
-    def _confirm_discard(self) -> bool:
-        return not self._has_unsaved_input() or messagebox.askyesno("未保存の変更", "保存していない変更は破棄されます。よろしいですか?")
+    def close(self) -> None:
+        if not self.confirm_discard():
+            return
+        self.destroy()
+        if self.on_close:
+            self.on_close(self.saved_paths)
+
+    def confirm_discard(self) -> bool:
+        return not self._has_unsaved_input() or messagebox.askyesno("未保存の変更", "保存していない変更は破棄されます。よろしいですか?", parent=self)
 
     def choose_file(self) -> None:
-        path = filedialog.asksaveasfilename(initialdir=MATERIALS_DIR, defaultextension=".json", filetypes=[("JSON", "*.json")], confirmoverwrite=False)
+        path = filedialog.asksaveasfilename(initialdir=MATERIALS_DIR, defaultextension=".json", filetypes=[("JSON", "*.json")], confirmoverwrite=False, parent=self)
         if path:
             self.file_var.set(display_path(Path(path)))
             self.load_file()
 
     def load_file(self) -> None:
         path = resolve_material(self.file_var.get())
-        if path == self.loaded_path or not self._confirm_discard():
+        if path == self.loaded_path or not self.confirm_discard():
             return
         try:
             entries = load_entries(path)
         except (OSError, ValueError) as error:
-            messagebox.showerror("読み込みに失敗しました", str(error))
+            messagebox.showerror("読み込みに失敗しました", str(error), parent=self)
             return
         self.entries = entries
         self.loaded_path = path
@@ -418,10 +433,15 @@ class WordEditor(tk.Tk):
         query = self.search_var.get().strip().lower()
         self.list_indices = [index for index, entry in enumerate(self.entries) if query in str(entry.get("word", "")).lower()]
         self.word_list.delete(0, "end")
+        # 同じ単語が出典・レベル違いで複数あるときは区別できるようにレベルを添える
+        counts = Counter((entry.get("word"), entry.get("language", "English")) for entry in self.entries)
         for index in self.list_indices:
             entry = self.entries[index]
             language = entry.get("language", "English")
-            self.word_list.insert("end", entry.get("word", "") + ("" if language == "English" else f" [{language}]"))
+            label = entry.get("word", "") + ("" if language == "English" else f" [{language}]")
+            if counts[entry.get("word"), language] > 1:
+                label += f" ({entry.get('difficulty') or '-'} / {entry.get('source') or '-'})"
+            self.word_list.insert("end", label)
         if self.current_index in self.list_indices:
             row = self.list_indices.index(self.current_index)
             self.word_list.selection_set(row)
@@ -431,7 +451,7 @@ class WordEditor(tk.Tk):
         selection = self.word_list.curselection()
         if not selection or self.list_indices[selection[0]] == self.current_index:
             return
-        if not self._confirm_discard():
+        if not self.confirm_discard():
             self.refresh_word_list()
             return
         self.load_entry(self.list_indices[selection[0]])
@@ -441,7 +461,7 @@ class WordEditor(tk.Tk):
         try:
             derivatives = normalize_derivatives(entry)
         except ValueError as error:
-            messagebox.showerror("読み込めない単語データです", str(error))
+            messagebox.showerror("読み込めない単語データです", str(error), parent=self)
             return
         self.clear_word()
         self.current_index = index
@@ -460,7 +480,7 @@ class WordEditor(tk.Tk):
         self.status_var.set(f"編集中: {entry.get('word')}")
 
     def new_word(self) -> None:
-        if self._confirm_discard():
+        if self.confirm_discard():
             self.clear_word()
             self.word_entry.focus_set()
             self.status_var.set("新しい単語を入力してください")
@@ -520,7 +540,7 @@ class WordEditor(tk.Tk):
         part_of_speech = self.pos_var.get().strip()
         meaning_ja = self.meaning_var.get().strip()
         if not part_of_speech or not meaning_ja:
-            messagebox.showwarning("入力不足", "品詞と意味を入力してください")
+            messagebox.showwarning("入力不足", "品詞と意味を入力してください", parent=self)
             return None
         meaning: dict = {"meaning_ja": meaning_ja}
         for form_field in self._language().fields_for(part_of_speech):
@@ -542,6 +562,7 @@ class WordEditor(tk.Tk):
             "穴埋めに使えない例文",
             "次の例文は単語の位置を判定できないため穴埋めに出題されません。\n"
             "例文中の該当箇所を [ ] で囲むと出題できます。このまま登録しますか?\n\n" + "\n".join(unusable),
+            parent=self,
         ):
             return None
         if examples:
@@ -560,7 +581,7 @@ class WordEditor(tk.Tk):
 
     def update_meaning(self) -> bool:
         if self.editing_meaning is None:
-            messagebox.showwarning("未選択", "一覧から更新する意味を選んでください")
+            messagebox.showwarning("未選択", "一覧から更新する意味を選んでください", parent=self)
             return False
         result = self._meaning_from_form(self.pending_parts[self.editing_meaning][1])
         if result is None:
@@ -600,9 +621,10 @@ class WordEditor(tk.Tk):
         try:
             save_entries(self.loaded_path, entries)
         except OSError as error:
-            messagebox.showerror("保存に失敗しました", str(error))
+            messagebox.showerror("保存に失敗しました", str(error), parent=self)
             return False
         self.entries = entries
+        self.saved_paths.add(self.loaded_path)
         return True
 
     def commit_meaning(self) -> bool:
@@ -617,38 +639,37 @@ class WordEditor(tk.Tk):
 
     def save_word(self) -> None:
         if resolve_material(self.file_var.get()) != self.loaded_path:
-            messagebox.showwarning("保存先が未読み込み", "保存先を変更した場合は Enter で読み込んでから保存してください")
+            messagebox.showwarning("保存先が未読み込み", "保存先を変更した場合は Enter で読み込んでから保存してください", parent=self)
             return
         word = self.word_var.get().strip()
         if not word:
-            messagebox.showwarning("入力不足", "単語を入力してください")
+            messagebox.showwarning("入力不足", "単語を入力してください", parent=self)
             return
         # 意味欄に入力したまま保存した場合は、その意味も含める
         if not self.commit_meaning():
             return
         if not self.pending_parts:
-            messagebox.showwarning("入力不足", "意味を1つ以上追加してください")
+            messagebox.showwarning("入力不足", "意味を1つ以上追加してください", parent=self)
             return
         try:
             derivatives = parse_derivatives(self.derivatives_var.get())
         except ValueError as error:
-            messagebox.showwarning("派生語の形式", str(error))
+            messagebox.showwarning("派生語の形式", str(error), parent=self)
             return
 
         entry = self._build_entry(word, derivatives)
         entries = copy.deepcopy(self.entries)
         duplicate = next((
-            index for index, item in enumerate(entries)
-            if index != self.current_index and item.get("word") == word and item.get("language", "English") == entry["language"]
+            index for index, item in enumerate(entries) if index != self.current_index and entry_key(item) == entry_key(entry)
         ), None)
         if self.current_index is not None:
             if duplicate is not None:
-                messagebox.showwarning("重複", f"{word} ({entry['language']}) は既に登録されています")
+                messagebox.showwarning("重複", f"{word} ({entry['language']}) は同じ出典・レベルで既に登録されています", parent=self)
                 return
             entries[self.current_index] = entry
             action = "更新"
         elif duplicate is not None:
-            if not messagebox.askyesno("登録済みの単語", f"{word} は登録済みです。品詞・意味を追記しますか?"):
+            if not messagebox.askyesno("登録済みの単語", f"{word} は同じ出典・レベルで登録済みです。品詞・意味を追記しますか?", parent=self):
                 return
             merge_entry(entries, entry)
             action = "既存の単語に追記"
@@ -663,10 +684,10 @@ class WordEditor(tk.Tk):
 
     def delete_word(self) -> None:
         if self.current_index is None:
-            messagebox.showwarning("未選択", "一覧から削除する単語を選んでください")
+            messagebox.showwarning("未選択", "一覧から削除する単語を選んでください", parent=self)
             return
         word = self.entries[self.current_index].get("word")
-        if not messagebox.askyesno("単語を削除", f"{word} をJSONから削除しますか?\n(取り込み済みのDBからは削除されません)"):
+        if not messagebox.askyesno("単語を削除", f"{word} をJSONから削除しますか?\n(取り込み済みのDBからは削除されません)", parent=self):
             return
         entries = copy.deepcopy(self.entries)
         del entries[self.current_index]
@@ -676,4 +697,8 @@ class WordEditor(tk.Tk):
 
 
 if __name__ == "__main__":
-    WordEditor().mainloop()
+    # 単体で起動したときは空のルートウィンドウを隠し、エディタを閉じたら終了する
+    root = tk.Tk()
+    root.withdraw()
+    WordEditor(root, on_close=lambda paths: root.destroy())
+    root.mainloop()
