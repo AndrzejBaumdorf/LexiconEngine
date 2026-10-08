@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections import Counter
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -10,19 +11,48 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from cloze import blank_out, find_cloze_spans
-from german import NO_PLURAL
-from languages import FORM_KEYS, GENDERS, get_language
+from languages import FORM_KEYS, GENDERS, NO_PLURAL, Language, get_language, mark_separable, split_separable
 
 
 RECENT_HISTORY_LIMIT = 10
 # 類義語・対義語を文字列だけで登録すると英単語自体が意味になるため、出題対象から除外する
 HAS_REAL_MEANING = "m.meaning_ja != w.word"
 CHOICE_POOL_SIZE = 30
+# 活用クイズの重みの下限。正解し続けた動詞・人称・時制でもたまには出す (未回答の組み合わせは 0.5³ = 0.125)
+MIN_CONJUGATION_WEIGHT = 0.01
 SIMILAR_MEANING_RATIO = 0.6
 MEANING_SEPARATOR = "\x1f"
 ANNOTATION_PATTERN = re.compile(r"[〈（(［\[《][^〉）)］\]》]*[〉）)］\]》]")
 CONTENT_PATTERN = re.compile(r"[\u3400-\u9fff々\u30a1-\u30ff]")
 LEGACY_POS_NAMES = {"noun": "名詞", "verb": "動詞", "adjective": "形容詞", "adverb": "副詞"}
+
+
+# 意味 (日本語) の中で外国語の単語の境目を判定する文字。\w だと「Angebotで」の「で」まで単語の続きになる
+WORD_CHAR = "[A-Za-z\u00c0-\u024f\uac00-\ud7a3]"
+
+
+def mask_headword(text: str, word: str, language: str) -> str:
+    """答えが見出し語になる問題 (日→独、穴埋めのヒント) で、意味の中の見出し語を - に伏せる。
+    （im Angebotで）→（im -で）。語幹だけの見出し語 (all-) は語頭の一致で伏せる (alles →  -es)"""
+    plain = split_separable(word)[0]
+    if plain.endswith("-"):
+        stem = plain.rstrip("-")
+        return re.sub(rf"(?<!{WORD_CHAR}){re.escape(stem)}(?={WORD_CHAR})", "-", text, flags=re.IGNORECASE) if stem else text
+    forms = {plain.lower()} | get_language(language).inflect(plain.lower()) if " " not in plain else {plain.lower()}
+    alternatives = "|".join(re.escape(form) for form in sorted(forms, key=len, reverse=True))
+    return re.sub(rf"(?<!{WORD_CHAR})(?:{alternatives})(?!{WORD_CHAR})", "-", text, flags=re.IGNORECASE)
+
+
+def valency_preposition(word: str, part_of_speech: str) -> str:
+    """前置詞そのものの格支配 (an + Dat) では見出し語が前置詞になる"""
+    return word if part_of_speech == "前置詞" else ""
+
+
+def valency_note(language: str, valency_json: str | None) -> str:
+    """問題文や一覧で意味の後ろに付ける格支配の表示 ( ［+ Akk, von + Dat］)。なければ空"""
+    if not valency_json:
+        return ""
+    return f" ［{get_language(language).format_valency(json.loads(valency_json))}］"
 
 
 def _meaning_key(meaning_ja: str) -> str:
@@ -70,10 +100,14 @@ class QuizScope:
     language: str | None = None
     sources: tuple[str, ...] = ()
     difficulties: tuple[str, ...] = ()
+    parts_of_speech: tuple[str, ...] = ()
 
-    def condition(self, word: str = "w", meaning: str = "m") -> tuple[str, tuple]:
+    def condition(self, word: str = "w", meaning: str = "m", part: str = "p") -> tuple[str, tuple]:
         # 出典・レベルは意味ごとに判定する。A1 の aber (接続詞) と A2 の aber (心態詞) をレベルで出し分けるため
         clauses, params = [f"(? IS NULL OR {word}.language = ?)"], [self.language, self.language]
+        if self.parts_of_speech:
+            clauses.append(f"{part}.name IN ({', '.join('?' for _ in self.parts_of_speech)})")
+            params += self.parts_of_speech
         if self.sources or self.difficulties:
             entry_clauses = [f"em.meaning_id = {meaning}.id"]
             if self.sources:
@@ -89,12 +123,53 @@ class QuizScope:
         return " AND ".join(clauses), tuple(params)
 
 
+class CleanupReport(NamedTuple):
+    """JSONとの照合で消える (消えた) もの"""
+    # JSONにない見出し: (単語, 言語, 出典, レベル)
+    entries: list[tuple[str, str, str, str]]
+    # どの見出しにも属さず、類義語・派生語としても参照されていない単語: (単語, 言語, 回答履歴の件数)
+    words: list[tuple[str, str, int]]
+
+
 @dataclass
 class ImportedEntry:
     """1回の取り込みで見出し (単語×出典×レベル) に含まれていた品詞・意味・例文"""
     part_ids: set[int] = field(default_factory=set)
     meaning_ids: set[int] = field(default_factory=set)
     sentences: set[str] = field(default_factory=set)
+
+
+# 意味を問う問題とは別に正答率を集計する問題形式 (語形・綴りの知識を問うもの)。それ以外の形式は「意味」にまとめる
+SEPARATE_POOL_TYPES = ("gender", "plural", "valency", "conjugation", "romanization")
+MEANING_POOL = "meaning"
+
+
+def history_pool(question_type: str) -> str:
+    return question_type if question_type in SEPARATE_POOL_TYPES else MEANING_POOL
+
+
+class PoolStats(NamedTuple):
+    answered: int = 0
+    correct: int = 0
+
+    @property
+    def accuracy(self) -> float | None:
+        return self.correct / self.answered * 100 if self.answered else None
+
+
+class WordStats(NamedTuple):
+    """単語一覧の1行。回答履歴は単語ごとに記録されるので、意味・品詞はまとめて表示する"""
+    word_id: int
+    word: str
+    parts_of_speech: str
+    meanings: str
+    sources: str
+    # 集計の単位 (意味・性・複数形・転写) → 回答数と正答数
+    pools: dict[str, PoolStats]
+    last_answered: str | None
+
+    def pool(self, name: str) -> PoolStats:
+        return self.pools.get(name, PoolStats())
 
 
 class ClozeSentence(NamedTuple):
@@ -111,10 +186,31 @@ class Question:
     word_id: int
     question_type: str
     prompt: str
+    # 空なら選択式ではなく入力式 (複数形など、誤った形を見せたくない問題)
     choices: list[str]
     answer: str
     # 正解の補足表示 (穴埋めで活用形が正解のとき "petrified (petrify)" など)
     answer_detail: str = ""
+    # 入力式で答えの前に付けてもよい語 (複数形の die など)
+    optional_prefixes: tuple[str, ...] = ()
+    # 入力式で answer のほかに正解とする書き方 (am Tisch に対する an dem Tisch など)
+    accepted: tuple[str, ...] = ()
+    # 問題の種類の内訳。回答履歴に残して集計に使う (活用クイズの {"person": "du", "tense": "現在"})
+    variant: dict | None = None
+
+    @property
+    def is_typed(self) -> bool:
+        return not self.choices
+
+    def is_correct(self, selected_answer: str) -> bool:
+        if not self.is_typed:
+            return selected_answer == self.answer
+        # 入力式は前後・連続する空白と、先頭の die などを無視する。大文字・小文字は区別しない
+        words = selected_answer.split()
+        if len(words) > 1 and words[0].lower() in self.optional_prefixes:
+            words = words[1:]
+        typed = " ".join(words).casefold()
+        return any(typed == " ".join(answer.split()).casefold() for answer in (self.answer, *self.accepted))
 
 
 class LexiconDatabase:
@@ -123,9 +219,16 @@ class LexiconDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        # 1セットの間だけ固定する出題の重み。begin_quiz_set() で作り直す。None なら毎回計算する
+        self._set_weights: dict | None = None
 
     def close(self) -> None:
         self.connection.close()
+
+    def begin_quiz_set(self) -> None:
+        """新しいセットを始める。活用クイズの重みはセットの最初の出題時に回答履歴から計算し、セットの間は固定する
+        (直前に間違えた形ばかり続けて出ないように)"""
+        self._set_weights = {}
 
     def initialize(self) -> None:
         self._migrate_legacy_schema()
@@ -133,9 +236,10 @@ class LexiconDatabase:
             """
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+            -- separable_prefix: 分離動詞の前つづり (JSON の見出し語 ab|fahren の ab)。word には印を外した abfahren を入れる
             CREATE TABLE IF NOT EXISTS words (
                 id INTEGER PRIMARY KEY, word TEXT NOT NULL, language TEXT NOT NULL DEFAULT 'English',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(word, language)
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, separable_prefix TEXT, UNIQUE(word, language)
             );
             -- 見出し: 単語がどの出典のどのレベルに載っているか。同じ単語が A1 と A2 に別見出しで載ることがある
             CREATE TABLE IF NOT EXISTS entries (
@@ -149,7 +253,7 @@ class LexiconDatabase:
             );
             CREATE TABLE IF NOT EXISTS meanings (
                 id INTEGER PRIMARY KEY, part_of_speech_id INTEGER NOT NULL, meaning_ja TEXT NOT NULL,
-                forms TEXT, UNIQUE(part_of_speech_id, meaning_ja), FOREIGN KEY (part_of_speech_id) REFERENCES parts_of_speech(id) ON DELETE CASCADE
+                forms TEXT, valency TEXT, UNIQUE(part_of_speech_id, meaning_ja), FOREIGN KEY (part_of_speech_id) REFERENCES parts_of_speech(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS examples (
                 id INTEGER PRIMARY KEY, word_id INTEGER NOT NULL, sentence TEXT NOT NULL,
@@ -198,8 +302,9 @@ class LexiconDatabase:
             """
         )
         self._migrate_meaning_schema()
-        self._add_missing_columns()
+        # words を作り直す移行のあとで列を足す
         self._migrate_entries()
+        self._add_missing_columns()
         self.connection.commit()
 
     def _migrate_entries(self) -> None:
@@ -256,8 +361,15 @@ class LexiconDatabase:
     def _add_missing_columns(self) -> None:
         for table, column, declaration in (
             ("meanings", "forms", "TEXT"),
+            # 格支配 (["Akk", "von+Dat"] の JSON)
+            ("meanings", "valency", "TEXT"),
             ("examples", "targets", "TEXT"),
             ("examples", "meaning_id", "INTEGER REFERENCES meanings(id) ON DELETE SET NULL"),
+            ("words", "separable_prefix", "TEXT"),
+            # 問題の種類の内訳 (活用クイズの人称・時制) の JSON
+            ("answer_history", "variant", "TEXT"),
+            # 格支配クイズ用の例文の穴 ({"slot": "von+Dat", "phrase": "vom Bahnhof", "hint": "der Bahnhof"} の JSON)
+            ("examples", "valency", "TEXT"),
         ):
             columns = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if column not in columns:
@@ -344,6 +456,84 @@ class LexiconDatabase:
         )
         self.connection.commit()
         self.connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def json_entry_keys(json_paths: list[Path]) -> set[tuple[str, str, str, str]]:
+        """JSONにある見出しの (単語, 言語, 出典, レベル)。取り込み時と同じ既定値・正規化をする"""
+        keys = set()
+        for json_path in json_paths:
+            with json_path.open(encoding="utf-8") as file:
+                payload = json.load(file)
+            for entry in [payload] if isinstance(payload, dict) else payload:
+                if isinstance(entry, dict) and isinstance(entry.get("word"), str):
+                    keys.add((
+                        split_separable(entry["word"].strip())[0], entry.get("language", "English"),
+                        entry.get("source", "JSON"), (entry.get("difficulty") or "").strip(),
+                    ))
+        return keys
+
+    def remove_missing_entries(self, json_paths: list[Path], apply: bool) -> CleanupReport:
+        """DBにあってJSONのどこにもない見出しを消し、どの見出しにも属さなくなった単語を回答履歴ごと消す。
+        apply=False なら何が消えるかだけを返して元に戻す"""
+        keys = self.json_entry_keys(json_paths)
+        rows = self.connection.execute(
+            """
+            SELECT e.id, e.word_id, w.word, w.language, s.name AS source, e.difficulty
+            FROM entries e JOIN words w ON w.id = e.word_id JOIN sources s ON s.id = e.source_id
+            ORDER BY w.language, w.word
+            """
+        ).fetchall()
+        missing = [row for row in rows if (row["word"], row["language"], row["source"], row["difficulty"]) not in keys]
+        try:
+            for row in missing:
+                self.connection.execute("DELETE FROM entries WHERE id=?", (row["id"],))
+            for word_id in {row["word_id"] for row in missing}:
+                self._collect_unlinked(word_id)
+            deleted_words = self._delete_unused_words()
+        except Exception:
+            self.connection.rollback()
+            raise
+        if apply:
+            self.connection.commit()
+        else:
+            self.connection.rollback()
+        return CleanupReport([(row["word"], row["language"], row["source"], row["difficulty"]) for row in missing], deleted_words)
+
+    def _collect_unlinked(self, word_id: int) -> None:
+        """どの見出しにも属さなくなった意味・例文・品詞を消す。他の単語の類義語として参照されている意味は残す"""
+        self.connection.execute(
+            """
+            DELETE FROM meanings
+            WHERE part_of_speech_id IN (SELECT id FROM parts_of_speech WHERE word_id=?)
+              AND id NOT IN (SELECT meaning_id FROM entry_meanings)
+              AND id NOT IN (SELECT related_meaning_id FROM meaning_relations)
+            """,
+            (word_id,),
+        )
+        self.connection.execute(
+            "DELETE FROM parts_of_speech WHERE word_id=? AND NOT EXISTS (SELECT 1 FROM meanings WHERE part_of_speech_id = parts_of_speech.id)",
+            (word_id,),
+        )
+        self.connection.execute("DELETE FROM examples WHERE word_id=? AND id NOT IN (SELECT example_id FROM entry_examples)", (word_id,))
+
+    def _delete_unused_words(self) -> list[tuple[str, str, int]]:
+        """見出しがなく、類義語・派生語としても参照されていない単語を消す (回答履歴も消える)。消した (単語, 言語, 履歴件数) を返す"""
+        rows = self.connection.execute(
+            """
+            SELECT w.id, w.word, w.language, (SELECT COUNT(*) FROM answer_history h WHERE h.word_id = w.id) AS history
+            FROM words w
+            WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.word_id = w.id)
+              AND NOT EXISTS (SELECT 1 FROM derivations d WHERE d.derived_word_id = w.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM meaning_relations mr JOIN meanings m ON m.id = mr.related_meaning_id
+                  JOIN parts_of_speech p ON p.id = m.part_of_speech_id WHERE p.word_id = w.id
+              )
+            ORDER BY w.language, w.word
+            """
+        ).fetchall()
+        for row in rows:
+            self.connection.execute("DELETE FROM words WHERE id=?", (row["id"],))
+        return [(row["word"], row["language"], row["history"]) for row in rows]
 
     def import_json(self, json_path: Path) -> int:
         with json_path.open(encoding="utf-8") as file:
@@ -452,13 +642,25 @@ class LexiconDatabase:
                     "UPDATE meanings SET forms=? WHERE id=?",
                     (json.dumps(forms, ensure_ascii=False) if forms else None, meaning_id),
                 )
+                valency = meaning.get("valency") or []
+                if valency:
+                    language_spec = get_language(language)
+                    if not language_spec.cases:
+                        raise ValueError(f"{word}/{part_name}: {language} では valency (格支配) を使えません")
+                    try:
+                        valency = language_spec.parse_valency(valency)
+                    except ValueError as error:
+                        raise ValueError(f"{word}/{part_name}: {error}") from None
+                self.connection.execute(
+                    "UPDATE meanings SET valency=? WHERE id=?", (json.dumps(valency, ensure_ascii=False) if valency else None, meaning_id)
+                )
                 self._import_meaning_relations(meaning_id, meaning, language, part_name)
 
                 examples = meaning.get("examples", [])
                 if not isinstance(examples, list):
                     raise ValueError(f"{word}/{part_name}: examples は配列にしてください")
                 for example in examples:
-                    contents.sentences.add(self._insert_example(word, word_id, entry_id, example, meaning_id))
+                    contents.sentences.add(self._insert_example(word, word_id, entry_id, example, meaning_id, language, part_name))
 
         examples = entry.get("examples", []) if legacy_format else []
         if not isinstance(examples, list):
@@ -520,7 +722,27 @@ class LexiconDatabase:
             "DELETE FROM examples WHERE word_id=? AND id NOT IN (SELECT example_id FROM entry_examples)", (word_id,)
         )
 
-    def _insert_example(self, word: str, word_id: int, entry_id: int, example: object, meaning_id: int | None = None) -> str:
+    def _example_valency(self, word: str, language: str, sentence: str, valency: object, part_of_speech: str = "") -> str | None:
+        """例文の格支配の穴を検証して JSON にする。穴の句は、ヒントから作った正しい形のどれかと一致しなければならない"""
+        if valency is None:
+            return None
+        if not isinstance(valency, dict) or not all(isinstance(valency.get(key), str) and valency[key].strip() for key in ("slot", "phrase", "hint")):
+            raise ValueError(f"{word}: 例文の valency には slot・phrase・hint が必要です")
+        spec = get_language(language)
+        if spec.valency_answers is None:
+            raise ValueError(f"{word}: {language} では例文の valency を使えません")
+        slot = spec.parse_valency([valency["slot"]])[0]
+        phrase = valency["phrase"].strip()
+        if phrase not in sentence:
+            raise ValueError(f"{word}: 例文に「{phrase}」がありません: {sentence}")
+        answers = spec.valency_answers(slot, valency["hint"].strip(), valency_preposition(word, part_of_speech))
+        if phrase.casefold() not in {answer.casefold() for answer in answers}:
+            raise ValueError(f"{word}: 「{phrase}」は {slot} ({valency['hint']}) の形 ({' / '.join(answers)}) と一致しません: {sentence}")
+        return json.dumps({"slot": slot, "phrase": phrase, "hint": valency["hint"].strip()}, ensure_ascii=False)
+
+    def _insert_example(
+        self, word: str, word_id: int, entry_id: int, example: object, meaning_id: int | None = None, language: str = "", part_of_speech: str = "",
+    ) -> str:
         if not isinstance(example, dict) or not isinstance(example.get("sentence"), str):
             raise ValueError(f"{word}: examples の各要素には sentence が必要です")
         targets = example.get("targets")
@@ -529,11 +751,14 @@ class LexiconDatabase:
         sentence = example["sentence"].strip()
         self.connection.execute(
             """
-            INSERT INTO examples(word_id, sentence, translation_ja, targets, meaning_id) VALUES (?, ?, ?, ?, ?)
+            INSERT INTO examples(word_id, sentence, translation_ja, targets, meaning_id, valency) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(word_id, sentence) DO UPDATE SET
-                translation_ja=excluded.translation_ja, targets=excluded.targets, meaning_id=excluded.meaning_id
+                translation_ja=excluded.translation_ja, targets=excluded.targets, meaning_id=excluded.meaning_id, valency=excluded.valency
             """,
-            (word_id, sentence, example.get("translation_ja"), json.dumps(targets, ensure_ascii=False) if targets else None, meaning_id),
+            (
+                word_id, sentence, example.get("translation_ja"), json.dumps(targets, ensure_ascii=False) if targets else None, meaning_id,
+                self._example_valency(word, language, sentence, example.get("valency"), part_of_speech),
+            ),
         )
         self.connection.execute(
             "INSERT OR IGNORE INTO entry_examples(entry_id, example_id) SELECT ?, id FROM examples WHERE word_id=? AND sentence=?",
@@ -542,8 +767,13 @@ class LexiconDatabase:
         return sentence
 
     def _ensure_word(self, word: str, language: str) -> int:
+        # 分離動詞の印 (ab|fahren) は外して登録し、前つづりを別に覚える。印のない書き方で登録されても前つづりは消さない
+        word, prefix = split_separable(word)
         self.connection.execute("INSERT OR IGNORE INTO words (word, language) VALUES (?, ?)", (word, language))
-        return self.connection.execute("SELECT id FROM words WHERE word=? AND language=?", (word, language)).fetchone()[0]
+        word_id = self.connection.execute("SELECT id FROM words WHERE word=? AND language=?", (word, language)).fetchone()[0]
+        if prefix:
+            self.connection.execute("UPDATE words SET separable_prefix=? WHERE id=?", (prefix, word_id))
+        return word_id
 
     def _ensure_part_of_speech(self, word_id: int, name: str) -> int:
         self.connection.execute("INSERT OR IGNORE INTO parts_of_speech(word_id, name) VALUES (?, ?)", (word_id, name))
@@ -696,7 +926,7 @@ class LexiconDatabase:
         """穴埋めに使える例文を単語ごとに返す"""
         rows = self.connection.execute(
             """
-            SELECT e.word_id, e.sentence, e.targets, e.meaning_id, w.word, w.language,
+            SELECT e.word_id, e.sentence, e.targets, e.meaning_id, w.word, w.language, w.separable_prefix,
                 (SELECT GROUP_CONCAT(m.forms, char(31))
                  FROM parts_of_speech p JOIN meanings m ON m.part_of_speech_id = p.id
                  WHERE p.word_id = w.id AND m.forms IS NOT NULL) AS forms
@@ -715,7 +945,8 @@ class LexiconDatabase:
                 form for forms in (row["forms"].split("\x1f") if row["forms"] else ())
                 for form in language_spec.cloze_forms(json.loads(forms))
             ]
-            spans = find_cloze_spans(row["sentence"], row["word"], row["language"], targets, extra_forms)
+            headword = mark_separable(row["word"], row["separable_prefix"])
+            spans = find_cloze_spans(row["sentence"], headword, row["language"], targets, extra_forms)
             if not spans:
                 continue
             start, end = spans[0]
@@ -730,7 +961,7 @@ class LexiconDatabase:
         scope_condition, scope_params = scope.condition()
         rows = self.connection.execute(
             f"""
-            SELECT w.id, w.word, w.language, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms,
+            SELECT w.id, w.word, w.language, w.separable_prefix, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency,
                 COALESCE((
                     SELECT AVG(CASE WHEN recent.is_correct = 0 THEN 1.0 ELSE 0.0 END)
                     FROM (
@@ -760,8 +991,8 @@ class LexiconDatabase:
         rows = self.connection.execute("SELECT language FROM words GROUP BY language ORDER BY COUNT(*) DESC, language").fetchall()
         return [row[0] for row in rows]
 
-    def scope_options(self, language: str) -> tuple[list[str], list[str]]:
-        """その言語で選べる出典とレベルを返す"""
+    def scope_options(self, language: str) -> tuple[list[str], list[str], list[str]]:
+        """その言語で選べる出典・レベル・品詞を返す。品詞は見出し語の意味が多い順"""
         sources = self.connection.execute(
             "SELECT DISTINCT s.name FROM entries e JOIN words w ON w.id = e.word_id JOIN sources s ON s.id = e.source_id"
             " WHERE w.language=? ORDER BY s.name",
@@ -772,7 +1003,17 @@ class LexiconDatabase:
             " WHERE w.language=? AND e.difficulty != '' ORDER BY e.difficulty",
             (language,),
         ).fetchall()
-        return [row[0] for row in sources], [row[0] for row in difficulties]
+        parts_of_speech = self.connection.execute(
+            f"""
+            SELECT p.name FROM words w
+            JOIN parts_of_speech p ON p.word_id = w.id
+            JOIN meanings m ON m.part_of_speech_id = p.id
+            WHERE w.language=? AND {HAS_REAL_MEANING} AND m.id IN (SELECT meaning_id FROM entry_meanings)
+            GROUP BY p.name ORDER BY COUNT(*) DESC, p.name
+            """,
+            (language,),
+        ).fetchall()
+        return [row[0] for row in sources], [row[0] for row in difficulties], [row[0] for row in parts_of_speech]
 
     def create_question(self, question_type: str, show_hint: bool = False, scope: QuizScope | None = None) -> Question:
         scope = scope or QuizScope()
@@ -782,14 +1023,17 @@ class LexiconDatabase:
             excluded_ids = self._choice_exclusion_ids(target["id"])
             choices = [target["meaning_ja"], *self._choice_candidates("m.meaning_ja", excluded_ids, target["part_of_speech"], target["meaning_ja"], target["language"], target["id"])]
             random.shuffle(choices)
-            prompt = get_language(target["language"]).headword(target["word"], json.loads(target["forms"] or "{}"))
-            return Question(target["id"], question_type, prompt, choices, target["meaning_ja"])
+            # 分離動詞は ab|fahren のように印を付けて見せる
+            headword = mark_separable(target["word"], target["separable_prefix"])
+            prompt = get_language(target["language"]).headword(headword, json.loads(target["forms"] or "{}"))
+            return Question(target["id"], question_type, prompt + valency_note(target["language"], target["valency"]), choices, target["meaning_ja"])
         if question_type == "japanese_to_english":
             target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
             excluded_ids = self._choice_exclusion_ids(target["id"])
             choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"], target["language"], target["id"])]
             random.shuffle(choices)
-            return Question(target["id"], question_type, target["meaning_ja"], choices, target["word"])
+            prompt = mask_headword(target["meaning_ja"], target["word"], target["language"]) + valency_note(target["language"], target["valency"])
+            return Question(target["id"], question_type, prompt, choices, target["word"])
         if question_type == "cloze":
             sentences = self._cloze_sentences(language)
             if not sentences:
@@ -807,7 +1051,7 @@ class LexiconDatabase:
                 item for item in sentences[target["id"]] if item.meaning_id in (None, target["meaning_id"])
             ])
             if show_hint:
-                prompt += f"\nヒント: {target['meaning_ja']}"
+                prompt += f"\nヒント: {mask_headword(target['meaning_ja'], target['word'], target['language'])}"
             excluded_ids = self._choice_exclusion_ids(target["id"])
             language_spec = get_language(target["language"])
             if form in (None, "base") or language_spec.inflect_to is None:
@@ -870,7 +1114,7 @@ class LexiconDatabase:
             random.shuffle(choices)
             label = "類義語" if relation["relation_type"] == "synonym" else "対義語"
             return Question(target["id"], question_type, f"{target['word']} の{label}は?", choices, related)
-        if question_type in ("romanization", "gender", "plural") and not get_language(language or "").supports(question_type):
+        if question_type in ("romanization", "gender", "plural", "valency", "conjugation") and not get_language(language or "").supports(question_type):
             raise ValueError(f"{language} はこの問題形式に対応していません")
         if question_type == "gender":
             target = self._weighted_word(
@@ -883,6 +1127,10 @@ class LexiconDatabase:
                 target["id"], question_type, f"{target['word']} ({target['meaning_ja']})", list(articles.values()), articles[gender],
                 f"{articles[gender]} {target['word']}",
             )
+        if question_type == "valency":
+            return self._valency_question(scope)
+        if question_type == "conjugation":
+            return self._conjugation_question(scope)
         if question_type == "plural":
             # 複数形なし (Ausland の "-" など) は出題しない
             target = self._weighted_word(
@@ -892,11 +1140,13 @@ class LexiconDatabase:
             forms = json.loads(target["forms"])
             language_spec = get_language(target["language"])
             answer = forms["plural"].strip()
-            choices = [answer, *language_spec.plural_distractors(target["word"], answer)]
-            random.shuffle(choices)
-            # 単数形には冠詞を付けて出す (die Abfahrt)。性が未登録なら単語だけ
+            # 誤った複数形を目にしないよう、選択肢は出さずに入力させる。単数形には冠詞を付けて出す (die Abfahrt)
             headword = language_spec.headword(target["word"], {"gender": forms["gender"]} if forms.get("gender") else {})
-            return Question(target["id"], question_type, f"{headword} ({target['meaning_ja']}) の複数形は?", choices, answer)
+            article = language_spec.plural_article
+            return Question(
+                target["id"], question_type, f"{headword} ({target['meaning_ja']}) の複数形は?", [], answer,
+                f"{article} {answer}" if article else "", (article,) if article else (),
+            )
         if question_type == "romanization":
             language_spec = get_language(language or "")
             target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
@@ -933,11 +1183,177 @@ class LexiconDatabase:
             return Question(target["id"], question_type, prompt, choices, answer)
         raise ValueError(f"未対応の問題形式です: {question_type}")
 
+    def _valency_question(self, scope: QuizScope) -> Question:
+        """格支配クイズ。格支配の穴を持つ例文 (AI生成) の穴に、格変化させた句 (前置詞句・再帰代名詞) を入力させる。
+        例: ab|holen 迎えに行く ｜ Mein Vater holt mich ___ ab. (der Bahnhof) → vom Bahnhof"""
+        target = self._weighted_word(
+            "valency", scope,
+            where="m.id IN (SELECT meaning_id FROM examples WHERE valency IS NOT NULL AND meaning_id IS NOT NULL)",
+        )
+        example = random.choice(self.connection.execute(
+            "SELECT sentence, translation_ja, valency FROM examples WHERE meaning_id=? AND valency IS NOT NULL", (target["meaning_id"],)
+        ).fetchall())
+        valency = json.loads(example["valency"])
+        spec = get_language(target["language"])
+        answers = spec.valency_answers(valency["slot"], valency["hint"], valency_preposition(target["word"], target["part_of_speech"]))
+        # 例文に書かれた形を正解の表示に使い、融合しない形 (von dem Bahnhof) なども正解にする
+        phrase = valency["phrase"]
+        accepted = tuple(answer for answer in answers if answer.casefold() != phrase.casefold())
+        hint = "再帰代名詞" if valency["slot"].startswith("sich+") else valency["hint"].replace(" (Pl.)", "、複数")
+        headword = mark_separable(target["word"], target["separable_prefix"])
+        sentence = example["sentence"].replace(phrase, "___", 1)
+        prompt = f"{headword}  {target['meaning_ja']}\n{sentence}  ({hint})"
+        if example["translation_ja"]:
+            prompt += f"\n{example['translation_ja']}"
+        return Question(target["id"], "valency", prompt, [], phrase, example["sentence"], (), accepted)
+
+    def _conjugation_question(self, scope: QuizScope) -> Question:
+        """活用クイズ。人称と時制を示して、活用した形 (分離動詞は前つづりも、再帰動詞は再帰代名詞も) を入力させる。
+        例: ab|fahren 出発する ｜ du・現在 → fährst ab
+        出題は 動詞の誤り率 × 人称の誤り率 × 時制の誤り率 に比例させ、苦手な人称・時制を別の動詞でも練習させる"""
+        key = ("conjugation", scope)
+        candidates = self._set_weights.get(key) if self._set_weights is not None else None
+        if candidates is None:
+            candidates = self._conjugation_candidates(scope)
+            if self._set_weights is not None:
+                self._set_weights[key] = candidates
+        if not candidates:
+            raise ValueError("出題範囲に、活用クイズにできる動詞 (現在形・過去形などが登録された動詞) がありません")
+        target, cell, spec = random.choices([candidate[:3] for candidate in candidates], weights=[candidate[3] for candidate in candidates], k=1)[0]
+        headword = mark_separable(target["word"], target["separable_prefix"])
+        prompt = f"{headword}  {target['meaning_ja']}\n{cell.person}・{cell.tense} → ___"
+        pronouns = spec.conjugation_pronouns.get(cell.person, ())
+        return Question(
+            target["id"], "conjugation", prompt, [], cell.answers[0], f"{pronouns[0] if pronouns else ''} {cell.answers[0]}".strip(),
+            pronouns, tuple(cell.answers[1:]), {"person": cell.person, "tense": cell.tense},
+        )
+
+    def _conjugation_candidates(self, scope: QuizScope) -> list[tuple]:
+        """出題範囲の (意味, 人称・時制, 言語仕様, 重み) をすべて作る。誤り率は回答履歴から (誤答+1)/(回答+2) で平滑化する
+        (未回答は 0.5)。どの組み合わせも出なくならないよう重みに下限を設ける"""
+        scope_condition, scope_params = scope.condition()
+        rows = self.connection.execute(
+            f"""
+            SELECT w.id, w.word, w.language, w.separable_prefix, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency
+            FROM words w JOIN parts_of_speech p ON p.word_id = w.id JOIN meanings m ON m.part_of_speech_id = p.id
+            WHERE (json_extract(m.forms, '$.present_3sg') IS NOT NULL OR json_extract(m.forms, '$.past') IS NOT NULL)
+              AND {scope_condition}
+            """,
+            scope_params,
+        ).fetchall()
+
+        def smoothed(rows_: list[sqlite3.Row]) -> dict:
+            return {row["key"]: (row["answered"] - row["correct"] + 1) / (row["answered"] + 2) for row in rows_}
+
+        history = """
+            FROM answer_history h JOIN words w ON w.id = h.word_id
+            WHERE h.question_type = 'conjugation' AND (? IS NULL OR w.language = ?)
+        """
+        language_params = (scope.language, scope.language)
+        verb_rates = smoothed(self.connection.execute(
+            f"SELECT h.word_id AS key, COUNT(*) AS answered, SUM(h.is_correct) AS correct {history} GROUP BY h.word_id", language_params
+        ).fetchall())
+        person_rates, tense_rates = (
+            smoothed(self.connection.execute(
+                f"SELECT json_extract(h.variant, '$.{field}') AS key, COUNT(*) AS answered, SUM(h.is_correct) AS correct {history}"
+                f" AND h.variant IS NOT NULL GROUP BY key",
+                language_params,
+            ).fetchall())
+            for field in ("person", "tense")
+        )
+        # 意味が複数ある動詞 (aus|sehen) が意味の数だけ出やすくならないよう、意味の数で割る
+        meanings_per_word = Counter(row["id"] for row in rows)
+        candidates = []
+        for row in rows:
+            spec = get_language(row["language"])
+            if spec.conjugation_table is None:
+                continue
+            # 格支配に sich+Akk / sich+Dat がある意味 (sich ändern) は再帰代名詞も入れて活用する
+            reflexive = next((item.rpartition("+")[2] for item in json.loads(row["valency"] or "[]") if item.startswith("sich+")), None)
+            for cell in spec.conjugation_table(split_separable(row["word"])[0], row["separable_prefix"], json.loads(row["forms"]), reflexive):
+                weight = verb_rates.get(row["id"], 0.5) * person_rates.get(cell.person, 0.5) * tense_rates.get(cell.tense, 0.5)
+                candidates.append((row, cell, spec, max(weight, MIN_CONJUGATION_WEIGHT) / meanings_per_word[row["id"]]))
+        return candidates
+
     def record_answer(self, question: Question, selected_answer: str) -> bool:
-        correct = selected_answer == question.answer
-        self.connection.execute("INSERT INTO answer_history(word_id, question_type, selected_answer, correct_answer, is_correct) VALUES (?, ?, ?, ?, ?)", (question.word_id, question.question_type, selected_answer, question.answer, int(correct)))
+        correct = question.is_correct(selected_answer)
+        self.connection.execute(
+            "INSERT INTO answer_history(word_id, question_type, selected_answer, correct_answer, is_correct, variant) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                question.word_id, question.question_type, selected_answer, question.answer, int(correct),
+                json.dumps(question.variant, ensure_ascii=False) if question.variant else None,
+            ),
+        )
         self.connection.commit()
         return correct
+
+    def conjugation_stats(self, language: str) -> dict[tuple[str, str], PoolStats]:
+        """活用クイズの (人称, 時制) ごとの回答数・正答数"""
+        rows = self.connection.execute(
+            """
+            SELECT json_extract(h.variant, '$.person') AS person, json_extract(h.variant, '$.tense') AS tense,
+                COUNT(*) AS answered, SUM(h.is_correct) AS correct
+            FROM answer_history h JOIN words w ON w.id = h.word_id
+            WHERE h.question_type = 'conjugation' AND h.variant IS NOT NULL AND w.language = ?
+            GROUP BY person, tense
+            """,
+            (language,),
+        ).fetchall()
+        return {(row["person"], row["tense"]): PoolStats(row["answered"], row["correct"]) for row in rows}
+
+    def word_stats(self, language: str, meaning_question_type: str | None = None) -> list[WordStats]:
+        """その言語の単語ごとの回答数・正答数を、意味・性・複数形・転写の集計単位ごとに返す。
+        meaning_question_type を指定すると、意味の集計はその問題形式 (穴埋めだけなど) の回答だけを数える。
+        類義語などとして名前だけ登録された語 (意味がない語) は含めない"""
+        separate = ", ".join(f"'{question_type}'" for question_type in SEPARATE_POOL_TYPES)
+        history: dict[int, dict[str, PoolStats]] = {}
+        last_answered: dict[int, str] = {}
+        for row in self.connection.execute(
+            f"""
+            SELECT h.word_id,
+                CASE WHEN h.question_type IN ({separate}) THEN h.question_type ELSE '{MEANING_POOL}' END AS pool,
+                COUNT(*) AS answered, SUM(h.is_correct) AS correct, MAX(h.answered_at) AS last_answered
+            FROM answer_history h JOIN words w ON w.id = h.word_id
+            WHERE w.language = ? AND (h.question_type IN ({separate}) OR ? IS NULL OR h.question_type = ?)
+            GROUP BY h.word_id, pool
+            """,
+            (language, meaning_question_type, meaning_question_type),
+        ):
+            history.setdefault(row["word_id"], {})[row["pool"]] = PoolStats(row["answered"], row["correct"])
+            last_answered[row["word_id"]] = max(last_answered.get(row["word_id"], ""), row["last_answered"])
+        rows = self.connection.execute(
+            f"""
+            SELECT w.id, w.word, w.separable_prefix,
+                (SELECT GROUP_CONCAT(name, '・') FROM (
+                    SELECT DISTINCT p.name FROM parts_of_speech p JOIN meanings m ON m.part_of_speech_id = p.id
+                    WHERE p.word_id = w.id AND {HAS_REAL_MEANING})) AS parts_of_speech,
+                EXISTS (SELECT 1 FROM parts_of_speech p JOIN meanings m ON m.part_of_speech_id = p.id
+                    WHERE p.word_id = w.id AND {HAS_REAL_MEANING}) AS has_meaning,
+                (SELECT GROUP_CONCAT(label, ', ') FROM (
+                    SELECT DISTINCT s.name || CASE WHEN e.difficulty != '' THEN ' (' || e.difficulty || ')' ELSE '' END AS label
+                    FROM entries e JOIN sources s ON s.id = e.source_id WHERE e.word_id = w.id)) AS sources
+            FROM words w
+            WHERE w.language = ? AND has_meaning
+            """,
+            (language,),
+        ).fetchall()
+        meanings: dict[int, list[str]] = {}
+        for row in self.connection.execute(
+            f"""
+            SELECT w.id AS word_id, m.meaning_ja, m.valency FROM words w
+            JOIN parts_of_speech p ON p.word_id = w.id JOIN meanings m ON m.part_of_speech_id = p.id
+            WHERE w.language = ? AND {HAS_REAL_MEANING} ORDER BY p.id, m.id
+            """,
+            (language,),
+        ):
+            meanings.setdefault(row["word_id"], []).append(row["meaning_ja"] + valency_note(language, row["valency"]))
+        return [
+            WordStats(
+                row["id"], mark_separable(row["word"], row["separable_prefix"]), row["parts_of_speech"] or "", " ／ ".join(meanings[row["id"]]),
+                row["sources"] or "", history.get(row["id"], {}), last_answered.get(row["id"]),
+            )
+            for row in rows
+        ]
 
     def recent_accuracy(self, question_type: str | None = None, limit: int = 10, language: str | None = None) -> tuple[int, int, float]:
         row = self.connection.execute(

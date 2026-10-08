@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from database import LexiconDatabase, QuizScope
 from languages import get_language
 from word_editor import WordEditor
+from word_list import WordList
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon.db"
@@ -27,6 +28,8 @@ QUESTION_TYPES = [
     ("ラテン文字転写", "romanization"),
     ("性 (冠詞)", "gender"),
     ("複数形", "plural"),
+    ("格支配", "valency"),
+    ("活用", "conjugation"),
 ]
 
 
@@ -58,8 +61,12 @@ class QuizApp(tk.Tk):
         self.answered_count = 0
         self.show_hint = False
         self.answer_var = tk.IntVar(value=-1)
+        # 入力式の問題 (複数形など) の回答欄
+        self.typed_answer_var = tk.StringVar()
+        self.typed_entry: ttk.Entry | None = None
         self.answering = False
         self.editor: WordEditor | None = None
+        self.word_list: WordList | None = None
 
         self.columnconfigure(0, weight=1)
         self._build_db_frame()
@@ -80,8 +87,10 @@ class QuizApp(tk.Tk):
         ttk.Button(frame, text="JSON取り込み", command=self.import_json).grid(row=0, column=3, padx=5)
         ttk.Button(frame, text="フォルダ取り込み", command=self.import_folder).grid(row=0, column=4, padx=5)
         ttk.Button(frame, text="単語編集", command=self.open_editor).grid(row=0, column=5, padx=5)
+        ttk.Button(frame, text="単語一覧", command=self.open_word_list).grid(row=0, column=6, padx=5)
+        ttk.Button(frame, text="JSONと照合", command=self.remove_missing_words).grid(row=0, column=7, padx=5)
         self.db_status_var = tk.StringVar(value="未接続")
-        ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=6, sticky="w", padx=5, pady=(0, 5))
+        ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=8, sticky="w", padx=5, pady=(0, 5))
 
     def _build_setup_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="クイズ設定")
@@ -95,29 +104,32 @@ class QuizApp(tk.Tk):
         self.language_box.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         self.language_box.bind("<<ComboboxSelected>>", lambda event: self._on_language_selected())
 
-        # 出典・レベルは複数選択できる。何も選ばなければすべてが対象
+        # 出典・レベル・品詞は複数選択できる。何も選ばなければすべてが対象
         ttk.Label(frame, text="出典\n(未選択=すべて)").grid(row=1, column=0, sticky="nw", padx=5, pady=5)
         self.source_list = self._scope_list(frame, 1)
         ttk.Label(frame, text="レベル\n(未選択=すべて)").grid(row=2, column=0, sticky="nw", padx=5, pady=5)
         self.difficulty_list = self._scope_list(frame, 2)
+        ttk.Label(frame, text="品詞\n(未選択=すべて)").grid(row=3, column=0, sticky="nw", padx=5, pady=5)
+        self.part_of_speech_list = self._scope_list(frame, 3)
+        self.scope_lists = (self.source_list, self.difficulty_list, self.part_of_speech_list)
 
-        ttk.Label(frame, text="問題形式").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(frame, text="問題形式").grid(row=4, column=0, sticky="w", padx=5, pady=5)
         self.type_var = tk.StringVar()
         self.type_box = ttk.Combobox(frame, textvariable=self.type_var, state="readonly")
-        self.type_box.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
+        self.type_box.grid(row=4, column=1, sticky="ew", padx=5, pady=5)
         self.type_box.bind("<<ComboboxSelected>>", self._on_type_selected)
 
-        ttk.Label(frame, text="出題数 (1〜100)").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(frame, text="出題数 (1〜100)").grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.count_var = tk.StringVar(value="10")
-        ttk.Spinbox(frame, from_=1, to=100, textvariable=self.count_var, width=5).grid(row=4, column=1, sticky="w", padx=5, pady=5)
+        ttk.Spinbox(frame, from_=1, to=100, textvariable=self.count_var, width=5).grid(row=5, column=1, sticky="w", padx=5, pady=5)
 
         self.hint_var = tk.BooleanVar(value=False)
         self.hint_check = ttk.Checkbutton(frame, text="日本語ヒントを表示する (穴埋めのみ)", variable=self.hint_var)
-        self.hint_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
+        self.hint_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
         self.hint_check.state(["disabled"])
 
         self.start_button = ttk.Button(frame, text="開始", command=self.start_quiz)
-        self.start_button.grid(row=6, column=1, sticky="e", padx=5, pady=(0, 5))
+        self.start_button.grid(row=7, column=1, sticky="e", padx=5, pady=(0, 5))
         self._refresh_type_labels()
 
     def _scope_list(self, parent: ttk.Frame, row: int) -> tk.Listbox:
@@ -144,9 +156,9 @@ class QuizApp(tk.Tk):
         self._on_language_selected()
 
     def _on_language_selected(self) -> None:
-        # 出典・レベルの候補は選んだ言語に登録されているものだけにする。候補に残った値は選択を保つ
-        sources, difficulties = self.database.scope_options(self.language_var.get()) if self.database else ([], [])
-        for listbox, values in ((self.source_list, sources), (self.difficulty_list, difficulties)):
+        # 出典・レベル・品詞の候補は選んだ言語に登録されているものだけにする。候補に残った値は選択を保つ
+        options = self.database.scope_options(self.language_var.get()) if self.database else ([], [], [])
+        for listbox, values in zip(self.scope_lists, options):
             selected = self._selected_items(listbox)
             listbox.delete(0, "end")
             for index, value in enumerate(values):
@@ -156,7 +168,8 @@ class QuizApp(tk.Tk):
         self._refresh_type_labels()
 
     def _scope(self) -> QuizScope:
-        return QuizScope(self.language_var.get(), self._selected_items(self.source_list), self._selected_items(self.difficulty_list))
+        sources, difficulties, parts_of_speech = (self._selected_items(listbox) for listbox in self.scope_lists)
+        return QuizScope(self.language_var.get(), sources, difficulties, parts_of_speech)
 
     def _refresh_type_labels(self) -> None:
         selected = self._selected_type() if self.type_var.get() else QUESTION_TYPES[0][1]
@@ -255,7 +268,7 @@ class QuizApp(tk.Tk):
         flag = "!disabled" if enabled else "disabled"
         for child in self.setup_frame.winfo_children():
             child.state([flag])
-        for listbox in (self.source_list, self.difficulty_list):
+        for listbox in self.scope_lists:
             listbox.configure(state="normal" if enabled else "disabled")
         self._on_type_selected()
 
@@ -279,6 +292,7 @@ class QuizApp(tk.Tk):
         except (OSError, ValueError) as error:
             messagebox.showerror("データベースを開けません", str(error))
             return
+        self._close_word_list()
         if self.database is not None:
             self.database.close()
         self.database = database
@@ -317,6 +331,7 @@ class QuizApp(tk.Tk):
             except (OSError, ValueError) as error:
                 errors.append(f"{path.name}: {error}")
         self._refresh_languages()
+        self._refresh_word_list()
         message = f"{len(paths) - len(errors)}ファイル・{count}件取り込みました。"
         if errors:
             messagebox.showerror("一部の取り込みに失敗しました", message + "\n\n" + "\n".join(errors))
@@ -332,6 +347,25 @@ class QuizApp(tk.Tk):
             return
         self.editor = WordEditor(self, on_close=self._on_editor_closed)
 
+    def open_word_list(self) -> None:
+        if self.database is None:
+            messagebox.showwarning("未接続", "先にデータベースを開いてください")
+            return
+        if self.word_list is not None and self.word_list.winfo_exists():
+            self.word_list.deiconify()
+            self.word_list.lift()
+            self.word_list.refresh()
+            return
+        self.word_list = WordList(
+            self, self.database, self.database.languages(), self.language_var.get(), QUESTION_TYPES,
+            on_close=lambda: setattr(self, "word_list", None),
+        )
+
+    def _close_word_list(self) -> None:
+        if self.word_list is not None and self.word_list.winfo_exists():
+            self.word_list.destroy()
+        self.word_list = None
+
     def _on_editor_closed(self, saved_paths: set[Path]) -> None:
         # エディタはJSONだけを書き換えるので、保存したファイルをDBに取り込むか確認する
         self.editor = None
@@ -340,6 +374,48 @@ class QuizApp(tk.Tk):
         names = "\n".join(sorted(path.name for path in saved_paths))
         if messagebox.askyesno("DBに取り込む", f"編集したJSONをDBに取り込みますか?\n\n{names}", parent=self):
             self._import_files(sorted(saved_paths))
+
+    def remove_missing_words(self) -> None:
+        """選んだフォルダ (とサンプル) のJSONにない見出し・単語をDBから消す。消す前に内容を見せて確認する"""
+        if self.database is None:
+            messagebox.showwarning("未接続", "先にデータベースを開いてください")
+            return
+        folder = filedialog.askdirectory(title="照合するJSONのフォルダ", initialdir=MATERIALS_DIR, mustexist=True)
+        if not folder:
+            return
+        # 新規DBに自動で入るサンプルは教材フォルダの外にあるので、照合に含めて消さないようにする
+        paths = sorted(Path(folder).rglob("*.json"))
+        if DEFAULT_SAMPLE_JSON_PATH.exists() and DEFAULT_SAMPLE_JSON_PATH not in paths:
+            paths.append(DEFAULT_SAMPLE_JSON_PATH)
+        try:
+            report = self.database.remove_missing_entries(paths, apply=False)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("照合できません", str(error))
+            return
+        if not report.entries and not report.words:
+            messagebox.showinfo("照合完了", f"{len(paths)}ファイルと照合しました。DBにだけある単語はありません。")
+            return
+        lines = [f"・{word} [{language}] {source}" + (f" ({difficulty})" if difficulty else "") for word, language, source, difficulty in report.entries]
+        word_lines = [f"・{word} [{language}]" + (f" — 回答履歴 {history}件" if history else "") for word, language, history in report.words]
+        history = sum(count for *_, count in report.words)
+        message = (
+            f"{len(paths)}ファイルと照合しました。\n\n"
+            f"JSONにない見出し {len(report.entries)}件:\n{self._preview(lines)}\n\n"
+            f"消える単語 {len(report.words)}語" + (f" (回答履歴 {history}件も消えます)" if history else "") + f":\n{self._preview(word_lines)}\n\n"
+            "削除しますか? 元に戻せません。"
+        )
+        if not messagebox.askyesno("JSONにない単語を削除", message, icon="warning"):
+            return
+        self.database.remove_missing_entries(paths, apply=True)
+        self._refresh_languages()
+        self._refresh_word_list()
+        messagebox.showinfo("削除完了", f"見出し {len(report.entries)}件・単語 {len(report.words)}語を削除しました。")
+
+    @staticmethod
+    def _preview(lines: list[str], limit: int = 15) -> str:
+        if not lines:
+            return "(なし)"
+        return "\n".join(lines[:limit]) + (f"\n…ほか{len(lines) - limit}件" if len(lines) > limit else "")
 
     def start_quiz(self) -> None:
         if self.database is None:
@@ -361,6 +437,8 @@ class QuizApp(tk.Tk):
         self.answered_count = 0
         self.show_hint = self.question_type == "cloze" and self.hint_var.get()
         self.score_var.set("")
+        # 活用クイズの重みはセットの間は固定し、次のセットでこのセットの結果を反映する
+        self.database.begin_quiz_set()
         self._set_setup_enabled(False)
         self._set_quiz_active(True)
         self.next_question()
@@ -382,14 +460,48 @@ class QuizApp(tk.Tk):
         for widget in self.choices_frame.winfo_children():
             widget.destroy()
         self.answer_var.set(-1)
+        self.typed_entry = None
         for index, choice in enumerate(self.question.choices):
             ttk.Radiobutton(self.choices_frame, text=f"{index + 1}. {choice}", value=index, variable=self.answer_var).grid(row=index, column=0, sticky="w", pady=2)
         self.answer_button.configure(text="回答する (Enter)", command=self.submit_answer, state="normal")
         self.skip_button.configure(state="normal")
         self.answering = True
-        self.focus_set()
+        if self.question.is_typed:
+            self._build_typed_answer()
+        else:
+            self.focus_set()
+
+    def _build_typed_answer(self) -> None:
+        self.typed_answer_var.set("")
+        entry = ttk.Entry(self.choices_frame, textvariable=self.typed_answer_var, font=("", 12))
+        entry.grid(row=0, column=0, sticky="ew", pady=2)
+        # 入力欄の Enter で回答する。"break" でウィンドウ側の Enter (次の問題へ) まで伝わらないようにする
+        entry.bind("<Return>", lambda event: (self.submit_answer(), "break")[1])
+        entry.bind("<KP_Enter>", lambda event: (self.submit_answer(), "break")[1])
+        characters = get_language(self.quiz_language).special_characters
+        if characters:
+            buttons = ttk.Frame(self.choices_frame)
+            buttons.grid(row=1, column=0, sticky="w", pady=(2, 0))
+            for column, character in enumerate(characters):
+                ttk.Button(buttons, text=character, width=2, command=lambda character=character: self._insert_character(character)).grid(row=0, column=column, padx=1)
+        self.typed_entry = entry
+        entry.focus_set()
+
+    def _insert_character(self, character: str) -> None:
+        if self.typed_entry is not None and self.answering:
+            self.typed_entry.insert("insert", character)
+            self.typed_entry.focus_set()
 
     def submit_answer(self) -> None:
+        if not self.answering:
+            return
+        if self.question.is_typed:
+            typed = self.typed_answer_var.get().strip()
+            if not typed:
+                messagebox.showwarning("未入力", "答えを入力してください")
+                return
+            self._reveal(typed)
+            return
         selected_index = self.answer_var.get()
         if selected_index < 0:
             messagebox.showwarning("未選択", "回答を選択してください")
@@ -402,20 +514,32 @@ class QuizApp(tk.Tk):
 
     def _reveal(self, selected_answer: str) -> None:
         self.answering = False
-        for widget in self.choices_frame.winfo_children():
-            widget.configure(state="disabled")
+        self._disable_widgets(self.choices_frame)
+        # 入力欄にフォーカスがあると Enter で次の問題へ進めないため、ウィンドウに戻す
+        self.focus_set()
         self.answered_count += 1
         if self.database.record_answer(self.question, selected_answer):
             self.correct_count += 1
-            self.feedback_var.set("正解!")
+            # 入力式で大文字・小文字や die の有無だけ違うときは、正しい書き方も見せる
+            exact = not self.question.is_typed or selected_answer == self.question.answer
+            self.feedback_var.set("正解!" if exact else f"正解! ({self.question.answer_detail or self.question.answer})")
             self.feedback_label.configure(foreground="green")
         else:
             prefix = "スキップ" if selected_answer == SKIPPED_ANSWER else "不正解"
+            if self.question.is_typed and selected_answer != SKIPPED_ANSWER:
+                prefix += f" (入力: {selected_answer})"
             self.feedback_var.set(f"{prefix}。正解は {self.question.answer_detail or self.question.answer} です。")
             self.feedback_label.configure(foreground="red")
         is_last = self.question_index >= self.question_count
         self.answer_button.configure(text="結果を見る (Enter)" if is_last else "次の問題へ (Enter)", command=self.next_question)
         self.skip_button.configure(state="disabled")
+
+    def _disable_widgets(self, parent: tk.Misc) -> None:
+        for widget in parent.winfo_children():
+            if isinstance(widget, ttk.Frame):
+                self._disable_widgets(widget)
+            else:
+                widget.state(["disabled"])
 
     def finish_quiz(self) -> None:
         self._set_quiz_active(False)
@@ -426,6 +550,12 @@ class QuizApp(tk.Tk):
                 f"今回: {self.correct_count}/{self.answered_count} ({self.correct_count / self.answered_count * 100:.1f}%)\n"
                 f"{self.quiz_language} {question_label(self.question.question_type, self.quiz_language)} 直近{total}問: {accuracy:.1f}% ({correct}/{total})"
             )
+        self._refresh_word_list()
+
+    def _refresh_word_list(self) -> None:
+        # 開いている単語一覧に今回の回答や取り込んだ単語を反映する
+        if self.word_list is not None and self.word_list.winfo_exists():
+            self.word_list.refresh()
 
     def on_close(self) -> None:
         if self.editor is not None and self.editor.winfo_exists():

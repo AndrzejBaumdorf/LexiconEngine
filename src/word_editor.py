@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from cloze import find_cloze_spans, mark_spans, parse_marked
 from database import normalize_derivatives
-from languages import FORM_KEYS, LANGUAGES, Language, find_language, get_language
+from languages import FORM_KEYS, LANGUAGES, Language, find_language, get_language, split_separable
 
 
 MATERIALS_DIR = Path(__file__).resolve().parent.parent / "materials"
@@ -20,7 +20,7 @@ LANGUAGE_NAMES = [language.name for language in LANGUAGES]
 RELATION_TYPES = ("synonyms", "antonyms")
 # フォームで編集するキー。これ以外 (usages など) は編集時もそのまま残す
 WORD_KEYS = ("word", "language", "difficulty", "source", "parts_of_speech", "derivatives", "related_words")
-MEANING_KEYS = ("meaning_ja", *FORM_KEYS, "synonyms", "antonyms", "examples")
+MEANING_KEYS = ("meaning_ja", *FORM_KEYS, "valency", "synonyms", "antonyms", "examples")
 IS_MAC = sys.platform == "darwin"
 SHORTCUT_LABEL = "⌘" if IS_MAC else "Ctrl+"
 SHIFT_MASK = 0x0001
@@ -119,7 +119,8 @@ def _merge_meaning(existing: dict, meaning: dict) -> None:
 
 def entry_key(entry: dict) -> tuple[str, str, str, str]:
     """見出しの同一性。同じ単語でも出典やレベルが違えば別見出し (A1 の接続詞 aber と A2 の心態詞 aber など)"""
-    return entry.get("word"), entry.get("language", "English"), entry.get("source") or "", entry.get("difficulty") or ""
+    # 分離動詞の印の有無 (ab|fahren / abfahren) は同じ見出しとして扱う
+    return split_separable(entry.get("word") or "")[0], entry.get("language", "English"), entry.get("source") or "", entry.get("difficulty") or ""
 
 
 def merge_entry(entries: list[dict], entry: dict) -> bool:
@@ -248,6 +249,8 @@ class WordEditor(tk.Toplevel):
         self.meaning_var = tk.StringVar()
         # 語形 (性・複数形・動詞の活用) は欄を作り直しても入力値が残るよう、変数をキーごとに持つ
         self.form_vars = {key: tk.StringVar() for key in FORM_KEYS}
+        # 格支配。"Akk, von+Dat" のようにカンマ区切りで入力し、JSON では配列にする
+        self.valency_var = tk.StringVar()
         self.shown_form_fields: tuple | None = None
         self.synonyms_var = tk.StringVar()
         self.antonyms_var = tk.StringVar()
@@ -363,7 +366,13 @@ class WordEditor(tk.Toplevel):
             else:
                 widget = ttk.Entry(self.forms_frame, textvariable=variable)
             widget.grid(row=row, column=column * 2 + 1, sticky="ew", padx=5, pady=3)
-        if fields:
+        if language.cases:
+            # 格支配は品詞を問わず使う (動詞・前置詞・形容詞・名詞)
+            row = (len(fields) + 1) // 2
+            ttk.Label(self.forms_frame, text="格支配").grid(row=row, column=0, sticky="w", padx=5, pady=3)
+            ttk.Entry(self.forms_frame, textvariable=self.valency_var).grid(row=row, column=1, sticky="ew", padx=5, pady=3)
+            ttk.Label(self.forms_frame, text="例: Akk, von+Dat, sich+Akk", foreground="gray").grid(row=row, column=2, columnspan=2, sticky="w", padx=5)
+        if fields or language.cases:
             self.forms_frame.grid()
         else:
             self.forms_frame.grid_remove()
@@ -499,7 +508,7 @@ class WordEditor(tk.Toplevel):
 
     def clear_meaning_form(self) -> None:
         self.editing_meaning = None
-        for variable in (self.meaning_var, self.synonyms_var, self.antonyms_var, *self.form_vars.values()):
+        for variable in (self.meaning_var, self.synonyms_var, self.antonyms_var, self.valency_var, *self.form_vars.values()):
             variable.set("")
         self.examples_text.delete("1.0", "end")
         self.translations_text.delete("1.0", "end")
@@ -511,7 +520,10 @@ class WordEditor(tk.Toplevel):
             self.tree.insert("", "end", values=(
                 part_of_speech,
                 meaning["meaning_ja"],
-                " / ".join(meaning[key] for key in FORM_KEYS if meaning.get(key)),
+                " / ".join([
+                    *(meaning[key] for key in FORM_KEYS if meaning.get(key)),
+                    *([self._language().format_valency(meaning["valency"])] if meaning.get("valency") else []),
+                ]),
                 ", ".join(_relation_key(item) for item in meaning.get("synonyms", [])),
                 ", ".join(_relation_key(item) for item in meaning.get("antonyms", [])),
                 len(meaning.get("examples", [])),
@@ -528,6 +540,7 @@ class WordEditor(tk.Toplevel):
         for key, variable in self.form_vars.items():
             value = meaning.get(key) or ""
             variable.set(self._language().gender_label(value) if key == "gender" else value)
+        self.valency_var.set(", ".join(meaning.get("valency", [])))
         self.synonyms_var.set(format_relations(meaning.get("synonyms", [])))
         self.antonyms_var.set(format_relations(meaning.get("antonyms", [])))
         sentences, translations = format_examples(meaning.get("examples", []))
@@ -547,6 +560,12 @@ class WordEditor(tk.Toplevel):
             value = self._gender_code() if form_field.key == "gender" else self.form_vars[form_field.key].get().strip()
             if value:
                 meaning[form_field.key] = value
+        if self._language().cases and self.valency_var.get().strip():
+            try:
+                meaning["valency"] = self._language().parse_valency(self.valency_var.get())
+            except ValueError as error:
+                messagebox.showwarning("格支配の形式", str(error), parent=self)
+                return None
         for key, variable in zip(RELATION_TYPES, (self.synonyms_var, self.antonyms_var)):
             relations = parse_relations(variable.get(), part_of_speech)
             if relations:

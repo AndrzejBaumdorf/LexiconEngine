@@ -1,6 +1,7 @@
 """言語ごとの仕様。新しい言語や言語固有の項目はここに追加する。"""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -12,6 +13,8 @@ import korean
 VOWELS = "aeiou"
 GERMAN_ENDINGS = ("", "e", "en", "n", "s", "es", "er", "em", "ern", "st", "t", "et", "te", "ten", "test", "tet", "end")
 GENDER_NAMES = {"m": "男性", "f": "女性", "n": "中性"}
+# 複数形がないことを表す書き方 (Ausland など)。複数形クイズには出さない
+NO_PLURAL = ("", "-", "—", "–", "なし")
 
 
 def _english_forms(word: str) -> set[str]:
@@ -76,8 +79,24 @@ class Language:
     # romanization_distractors(見出し語, 正しい転写) → 誤答。None ならその言語では出題しない
     romanize: Callable[[str], str | None] | None = None
     romanization_distractors: Callable[[str, str], list[str]] | None = None
-    # 複数形クイズの誤答。plural_distractors(単数形, 正しい複数形) → 誤答。None ならその言語では出題しない
-    plural_distractors: Callable[[str, str], list[str]] | None = None
+    # 分離動詞の zu 不定詞で前つづりと動詞の間に入る語 (ab|fahren → abzufahren)
+    separable_infix: str = ""
+    # 再帰動詞の見出し語の先頭に付く代名詞 (sich anmelden)。例文では mich / dich などに変わるので穴埋めでは無視する
+    reflexive_pronoun: str = ""
+    # 例文穴埋めで、複合語の後半 (Stellenangebot の angebot) も穴にしてよいか
+    compound_words: bool = False
+    # 複数形に付ける冠詞 (ドイツ語の die)。複数形クイズで答えの前に付けてもよい
+    plural_article: str = ""
+    # 入力形式の問題で、入力欄の横にボタンとして出す文字 (キーボードで打ちにくいウムラウトなど)
+    special_characters: str = ""
+    # 格支配 (valency) に使える格の名前。空ならその言語では格支配を扱わない
+    cases: tuple[str, ...] = ()
+    # 格支配クイズ。valency_answers(格支配の1要素, ヒント) → 正解として認める句。例文の穴の句の検証にも使う
+    valency_answers: Callable[[str, str, str], list[str]] | None = None
+    # 活用クイズ。conjugation_table(印を外した見出し語, 前つづり, 登録された語形) → 人称・時制ごとの正解。
+    # conjugation_pronouns は答えの前に付けてもよい主語 (du fährst ab)
+    conjugation_table: Callable[[str, str | None, dict, str | None], list] | None = None
+    conjugation_pronouns: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def supports(self, question_type: str) -> bool:
         """言語固有の問題形式 (転写・性・複数形) を出題できるか"""
@@ -86,7 +105,11 @@ class Language:
         if question_type == "gender":
             return bool(self.articles)
         if question_type == "plural":
-            return self.plural_distractors is not None
+            return any(form_field.key == "plural" for form_field in self.all_form_fields)
+        if question_type == "valency":
+            return self.valency_answers is not None
+        if question_type == "conjugation":
+            return self.conjugation_table is not None
         return True
 
     @property
@@ -103,6 +126,31 @@ class Language:
 
     def fields_for(self, part_of_speech: str) -> tuple[FormField, ...]:
         return self.form_fields.get(part_of_speech.strip(), ())
+
+    def parse_valency(self, items: list[str] | str) -> list[str]:
+        """格支配を ["Akk", "von+Dat", "sich+Akk"] の形にそろえる。"Akk, von + Dat" のような文字列も受け付ける。
+        各要素は 格 / 前置詞+格 / sich+格。使えない書き方なら ValueError"""
+        if isinstance(items, str):
+            items = [item for item in re.split(r"[,，、]", items) if item.strip()]
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise ValueError("valency は文字列の配列にしてください")
+        normalized = []
+        for item in items:
+            item = re.sub(r"\s*\+\s*", "+", item.strip())
+            match = VALENCY_PATTERN.fullmatch(item)
+            if not match or match["case"] not in self.cases:
+                raise ValueError(f"格支配「{item}」は {' / '.join(self.cases)}、前置詞+格 (von+Dat)、sich+格 の形で書いてください")
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def format_valency(items: list[str]) -> str:
+        """表示用。["Akk", "von+Dat", "sich+Akk"] → + Akk, von + Dat, sich (Akk)"""
+        shown = []
+        for item in items:
+            head, _, case = item.rpartition("+")
+            shown.append(f"+ {case}" if not head else f"sich ({case})" if head == "sich" else f"{head} + {case}")
+        return ", ".join(shown)
 
     def gender_label(self, code: str) -> str:
         return f"{code} ({self.articles[code]}・{GENDER_NAMES[code]})" if code in self.articles else code
@@ -155,7 +203,15 @@ GERMAN = Language(
         ),
     },
     inflect=_german_forms,
-    plural_distractors=german.plural_distractors,
+    plural_article="die",
+    cases=("Nom", "Akk", "Dat", "Gen"),
+    valency_answers=german.valency_answers,
+    conjugation_table=german.conjugation_table,
+    conjugation_pronouns=german.PERSON_PRONOUNS,
+    separable_infix="zu",
+    reflexive_pronoun="sich",
+    compound_words=True,
+    special_characters="äöüßÄÖÜ",
 )
 KOREAN = Language(
     "Korean",
@@ -169,6 +225,28 @@ LANGUAGES = (ENGLISH, GERMAN, KOREAN)
 GENDERS = tuple(GENDER_NAMES)
 # どの言語でも語形として扱うキー。エディタではこれらを意味の編集対象として扱う
 FORM_KEYS = tuple(dict.fromkeys(form_field.key for language in LANGUAGES for form_field in language.all_form_fields))
+
+
+SEPARABLE_MARK = "|"
+# 格支配の1要素: 格 / 前置詞+格 / sich+格
+VALENCY_PATTERN = re.compile(r"(?:(?P<head>[^\W\d_]+)\+)?(?P<case>[A-Z][a-z]+)")
+
+
+def split_separable(word: str) -> tuple[str, str | None]:
+    """分離動詞の印を外す。"ab|fahren" → ("abfahren", "ab")、"sich an|melden" → ("sich anmelden", "an")"""
+    *head, last = word.strip().split(" ")
+    if SEPARABLE_MARK not in last:
+        return word.strip(), None
+    prefix, stem = last.split(SEPARABLE_MARK, 1)
+    return " ".join([*head, prefix + stem]), prefix or None
+
+
+def mark_separable(word: str, prefix: str | None) -> str:
+    """split_separable の逆。前つづりの後ろに印を付ける ("abfahren", "ab") → ab|fahren"""
+    *head, last = word.split(" ")
+    if not prefix or not last.startswith(prefix) or len(last) == len(prefix):
+        return word
+    return " ".join([*head, prefix + SEPARABLE_MARK + last[len(prefix):]])
 
 
 def find_language(name: str) -> Language | None:
