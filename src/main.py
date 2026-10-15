@@ -11,6 +11,7 @@ from database import LexiconDatabase, QuizScope
 from languages import get_language
 from word_editor import WordEditor
 from word_list import WordList
+from sync_dialog import SyncDialog, TransferRow
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon.db"
@@ -18,6 +19,12 @@ DEFAULT_SAMPLE_JSON_PATH = Path(__file__).resolve().parent.parent / "samples" / 
 MATERIALS_DIR = Path(__file__).resolve().parent.parent / "materials"
 # 問題形式のIDは回答履歴に保存されるため変えない。表示名の {lang} は選んだ言語の略称 (英・独など) になる
 SKIPPED_ANSWER = "(スキップ)"
+MAX_QUESTION_COUNT = 1000
+# 出題モードの表示名 → database.SCORE_MODES。先頭が初期値
+SCORE_MODE_LABELS = {
+    "未習得スコア (未回答・回答の少ない単語も優先)": "unlearned",
+    "誤答スコア (最近間違えた単語だけを優先。見直し用)": "incorrect",
+}
 SCOPE_LIST_HEIGHT = 4
 QUESTION_TYPES = [
     ("{lang}→日", "english_to_japanese"),
@@ -31,6 +38,14 @@ QUESTION_TYPES = [
     ("格支配", "valency"),
     ("活用", "conjugation"),
 ]
+
+
+def file_label(path: Path) -> str:
+    """出題範囲の「ファイル」に出す名前。教材フォルダの中なら相対パス (basic/basic_time.json)、外ならファイル名"""
+    try:
+        return path.resolve().relative_to(MATERIALS_DIR).as_posix()
+    except ValueError:
+        return path.name
 
 
 def available_question_types(language: str) -> list[str]:
@@ -88,7 +103,7 @@ class QuizApp(tk.Tk):
         ttk.Button(frame, text="フォルダ取り込み", command=self.import_folder).grid(row=0, column=4, padx=5)
         ttk.Button(frame, text="単語編集", command=self.open_editor).grid(row=0, column=5, padx=5)
         ttk.Button(frame, text="単語一覧", command=self.open_word_list).grid(row=0, column=6, padx=5)
-        ttk.Button(frame, text="JSONと照合", command=self.remove_missing_words).grid(row=0, column=7, padx=5)
+        ttk.Button(frame, text="JSONと照合", command=self.sync_with_json).grid(row=0, column=7, padx=5)
         self.db_status_var = tk.StringVar(value="未接続")
         ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=8, sticky="w", padx=5, pady=(0, 5))
 
@@ -111,25 +126,33 @@ class QuizApp(tk.Tk):
         self.difficulty_list = self._scope_list(frame, 2)
         ttk.Label(frame, text="品詞\n(未選択=すべて)").grid(row=3, column=0, sticky="nw", padx=5, pady=5)
         self.part_of_speech_list = self._scope_list(frame, 3)
-        self.scope_lists = (self.source_list, self.difficulty_list, self.part_of_speech_list)
+        ttk.Label(frame, text="ファイル\n(未選択=すべて)").grid(row=4, column=0, sticky="nw", padx=5, pady=5)
+        self.file_list = self._scope_list(frame, 4)
+        self.scope_lists = (self.source_list, self.difficulty_list, self.part_of_speech_list, self.file_list)
 
-        ttk.Label(frame, text="問題形式").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(frame, text="問題形式").grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.type_var = tk.StringVar()
         self.type_box = ttk.Combobox(frame, textvariable=self.type_var, state="readonly")
-        self.type_box.grid(row=4, column=1, sticky="ew", padx=5, pady=5)
+        self.type_box.grid(row=5, column=1, sticky="ew", padx=5, pady=5)
         self.type_box.bind("<<ComboboxSelected>>", self._on_type_selected)
 
-        ttk.Label(frame, text="出題数 (1〜100)").grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(frame, text=f"出題数 (1〜{MAX_QUESTION_COUNT})").grid(row=6, column=0, sticky="w", padx=5, pady=5)
         self.count_var = tk.StringVar(value="10")
-        ttk.Spinbox(frame, from_=1, to=100, textvariable=self.count_var, width=5).grid(row=5, column=1, sticky="w", padx=5, pady=5)
+        ttk.Spinbox(frame, from_=1, to=MAX_QUESTION_COUNT, textvariable=self.count_var, width=5).grid(row=6, column=1, sticky="w", padx=5, pady=5)
+
+        ttk.Label(frame, text="出題モード").grid(row=7, column=0, sticky="w", padx=5, pady=5)
+        self.score_mode_var = tk.StringVar(value=next(iter(SCORE_MODE_LABELS)))
+        ttk.Combobox(frame, textvariable=self.score_mode_var, values=list(SCORE_MODE_LABELS), state="readonly", width=30).grid(
+            row=7, column=1, sticky="w", padx=5, pady=5
+        )
 
         self.hint_var = tk.BooleanVar(value=False)
         self.hint_check = ttk.Checkbutton(frame, text="日本語ヒントを表示する (穴埋めのみ)", variable=self.hint_var)
-        self.hint_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
+        self.hint_check.grid(row=8, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
         self.hint_check.state(["disabled"])
 
         self.start_button = ttk.Button(frame, text="開始", command=self.start_quiz)
-        self.start_button.grid(row=7, column=1, sticky="e", padx=5, pady=(0, 5))
+        self.start_button.grid(row=9, column=1, sticky="e", padx=5, pady=(0, 5))
         self._refresh_type_labels()
 
     def _scope_list(self, parent: ttk.Frame, row: int) -> tk.Listbox:
@@ -156,8 +179,8 @@ class QuizApp(tk.Tk):
         self._on_language_selected()
 
     def _on_language_selected(self) -> None:
-        # 出典・レベル・品詞の候補は選んだ言語に登録されているものだけにする。候補に残った値は選択を保つ
-        options = self.database.scope_options(self.language_var.get()) if self.database else ([], [], [])
+        # 出典・レベル・品詞・ファイルの候補は選んだ言語に登録されているものだけにする。候補に残った値は選択を保つ
+        options = self.database.scope_options(self.language_var.get()) if self.database else ([], [], [], [])
         for listbox, values in zip(self.scope_lists, options):
             selected = self._selected_items(listbox)
             listbox.delete(0, "end")
@@ -168,8 +191,8 @@ class QuizApp(tk.Tk):
         self._refresh_type_labels()
 
     def _scope(self) -> QuizScope:
-        sources, difficulties, parts_of_speech = (self._selected_items(listbox) for listbox in self.scope_lists)
-        return QuizScope(self.language_var.get(), sources, difficulties, parts_of_speech)
+        sources, difficulties, parts_of_speech, files = (self._selected_items(listbox) for listbox in self.scope_lists)
+        return QuizScope(self.language_var.get(), sources, difficulties, parts_of_speech, files)
 
     def _refresh_type_labels(self) -> None:
         selected = self._selected_type() if self.type_var.get() else QUESTION_TYPES[0][1]
@@ -285,7 +308,7 @@ class QuizApp(tk.Tk):
             database = LexiconDatabase(path)
             database.initialize()
             if not database_exists:
-                count = database.import_json(DEFAULT_SAMPLE_JSON_PATH)
+                count = database.import_json(DEFAULT_SAMPLE_JSON_PATH, file_label(DEFAULT_SAMPLE_JSON_PATH))
                 self.db_status_var.set(f"新規作成: {path.name} (サンプル{count}件取り込み)")
             else:
                 self.db_status_var.set(f"接続中: {path.name}")
@@ -327,7 +350,7 @@ class QuizApp(tk.Tk):
         errors = []
         for path in paths:
             try:
-                count += self.database.import_json(path)
+                count += self.database.import_json(path, file_label(path))
             except (OSError, ValueError) as error:
                 errors.append(f"{path.name}: {error}")
         self._refresh_languages()
@@ -375,8 +398,9 @@ class QuizApp(tk.Tk):
         if messagebox.askyesno("DBに取り込む", f"編集したJSONをDBに取り込みますか?\n\n{names}", parent=self):
             self._import_files(sorted(saved_paths))
 
-    def remove_missing_words(self) -> None:
-        """選んだフォルダ (とサンプル) のJSONにない見出し・単語をDBから消す。消す前に内容を見せて確認する"""
+    def sync_with_json(self) -> None:
+        """選んだフォルダ (とサンプル) のJSONとDBの単語データを照合し、違いを見せてからJSONに合わせる。
+        JSONを直したのに古い意味が残っている、JSONから消した単語が残っている、といったずれを直す"""
         if self.database is None:
             messagebox.showwarning("未接続", "先にデータベースを開いてください")
             return
@@ -387,43 +411,66 @@ class QuizApp(tk.Tk):
         paths = sorted(Path(folder).rglob("*.json"))
         if DEFAULT_SAMPLE_JSON_PATH.exists() and DEFAULT_SAMPLE_JSON_PATH not in paths:
             paths.append(DEFAULT_SAMPLE_JSON_PATH)
+        json_files = [(path, file_label(path)) for path in paths]
         try:
-            report = self.database.remove_missing_entries(paths, apply=False)
+            report = self.database.sync_with_json(json_files, apply=False)
         except (OSError, ValueError) as error:
             messagebox.showerror("照合できません", str(error))
             return
-        if not report.entries and not report.words:
-            messagebox.showinfo("照合完了", f"{len(paths)}ファイルと照合しました。DBにだけある単語はありません。")
+        if not report.changed:
+            messagebox.showinfo("照合完了", f"{len(paths)}ファイルと照合しました。DBはJSONと一致しています。")
             return
-        lines = [f"・{word} [{language}] {source}" + (f" ({difficulty})" if difficulty else "") for word, language, source, difficulty in report.entries]
-        word_lines = [f"・{word} [{language}]" + (f" — 回答履歴 {history}件" if history else "") for word, language, history in report.words]
-        history = sum(count for *_, count in report.words)
-        message = (
-            f"{len(paths)}ファイルと照合しました。\n\n"
-            f"JSONにない見出し {len(report.entries)}件:\n{self._preview(lines)}\n\n"
-            f"消える単語 {len(report.words)}語" + (f" (回答履歴 {history}件も消えます)" if history else "") + f":\n{self._preview(word_lines)}\n\n"
-            "削除しますか? 元に戻せません。"
-        )
-        if not messagebox.askyesno("JSONにない単語を削除", message, icon="warning"):
+        sections = [
+            ("綴りを直したとみなす単語", [f"{old} → {new} [{language}]" + (f" — 回答履歴 {count}件" if count else "") for language, old, new, count in report.renamed_words]),
+            ("消える単語", [f"{word} [{language}]" + (f" — 回答履歴 {count}件" if count else "") for language, word, count in report.removed_words]),
+            ("増える単語", [f"{word} [{language}]" for language, word, _ in report.added_words]),
+            ("消える見出し", [f"{word} — {source}" + (f" ({level})" if level else "") for _, word, source, level in report.removed_entries]),
+            ("増える見出し", [f"{word} — {source}" + (f" ({level})" if level else "") for _, word, source, level in report.added_entries]),
+            ("消える意味", [f"{word} ({part}) {meaning}" for _, word, part, meaning in report.removed_meanings]),
+            ("増える意味", [f"{word} ({part}) {meaning}" for _, word, part, meaning in report.added_meanings]),
+            ("消える例文", [f"{word}: {sentence}" for _, word, sentence in report.removed_examples]),
+            ("増える例文", [f"{word}: {sentence}" for _, word, sentence in report.added_examples]),
+        ]
+        lines = [f"{len(paths)}ファイルと照合しました。「反映」でDBの単語データをJSONに合わせます (元に戻せません)。"]
+        for title, items in sections:
+            if items:
+                lines.append(f"\n{title} {len(items)}件:\n" + "\n".join("・" + item for item in items))
+        if report.other_changes:
+            lines.append("\nほかに語形・格支配・訳・類義語・派生語の出典・取り込み元ファイルなどの違いも反映します。")
+        # 回答履歴のある消える単語は、意味が増える単語のどれかに履歴を引き継げる。綴りを直したとみなした単語は最初から選んでおく
+        rows = [TransferRow(language, old, count, new) for language, old, new, count in report.renamed_words if count]
+        rows += [TransferRow(language, word, count, None) for language, word, count in report.removed_words if count]
+        meanings: dict[tuple[str, str], list[str]] = {}
+        for language, word, part, meaning in report.added_meanings:
+            meanings.setdefault((language, word), []).append(f"({part}) {meaning}")
+        for language, _, new, _ in report.renamed_words:
+            meanings.setdefault((language, new), [])
+        candidates: dict[str, list[tuple[str, str]]] = {}
+        for (language, word), items in sorted(meanings.items(), key=lambda item: (item[0][0], item[0][1].casefold())):
+            text = " / ".join(items)
+            label = f"{word} — {text[:60]}…" if len(text) > 60 else f"{word} — {text}" if text else word
+            candidates.setdefault(language, []).append((label, word))
+        if rows:
+            lines.append("\n回答履歴のある消える単語は、下で引き継ぎ先を選べます。「(引き継がない)」の単語の回答履歴は消えます。")
+        transfers = SyncDialog.ask(self, "\n".join(lines), rows, candidates)
+        if transfers is None:
             return
-        self.database.remove_missing_entries(paths, apply=True)
+        try:
+            self.database.sync_with_json(json_files, apply=True, transfers=transfers)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("反映できません", str(error))
+            return
         self._refresh_languages()
         self._refresh_word_list()
-        messagebox.showinfo("削除完了", f"見出し {len(report.entries)}件・単語 {len(report.words)}語を削除しました。")
-
-    @staticmethod
-    def _preview(lines: list[str], limit: int = 15) -> str:
-        if not lines:
-            return "(なし)"
-        return "\n".join(lines[:limit]) + (f"\n…ほか{len(lines) - limit}件" if len(lines) > limit else "")
+        messagebox.showinfo("反映完了", "DBの単語データをJSONに合わせました。")
 
     def start_quiz(self) -> None:
         if self.database is None:
             messagebox.showwarning("未接続", "先にデータベースを開いてください")
             return
         count_text = self.count_var.get().strip()
-        if not count_text.isdigit() or not 1 <= int(count_text) <= 100:
-            messagebox.showwarning("入力エラー", "出題数は1〜100の整数で入力してください")
+        if not count_text.isdigit() or not 1 <= int(count_text) <= MAX_QUESTION_COUNT:
+            messagebox.showwarning("入力エラー", f"出題数は1〜{MAX_QUESTION_COUNT}の整数で入力してください")
             return
         if not self.language_var.get():
             messagebox.showwarning("単語がありません", "先に単語データを取り込んでください")
@@ -438,7 +485,7 @@ class QuizApp(tk.Tk):
         self.show_hint = self.question_type == "cloze" and self.hint_var.get()
         self.score_var.set("")
         # 活用クイズの重みはセットの間は固定し、次のセットでこのセットの結果を反映する
-        self.database.begin_quiz_set()
+        self.database.begin_quiz_set(SCORE_MODE_LABELS[self.score_mode_var.get()])
         self._set_setup_enabled(False)
         self._set_quiz_active(True)
         self.next_question()

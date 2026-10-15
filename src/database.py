@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import random
-from collections import Counter
+from collections import Counter, defaultdict
 import re
 import sqlite3
+import tempfile
 from dataclasses import dataclass, field
 from typing import NamedTuple
 from difflib import SequenceMatcher
@@ -14,12 +15,20 @@ from cloze import blank_out, find_cloze_spans
 from languages import FORM_KEYS, GENDERS, NO_PLURAL, Language, get_language, mark_separable, split_separable
 
 
-RECENT_HISTORY_LIMIT = 10
+# 出題の重みに使うスコア: 直近 RECENT_HISTORY_LIMIT 回の回答の誤答 (1/0) を、
+# 最新を 1、1つ前を RECENT_HISTORY_DECAY、2つ前を RECENT_HISTORY_DECAY² … とした加重平均にする。
+# 誤答スコアは答えた回だけで平均し、未習得スコアは RECENT_HISTORY_LIMIT 回に満たない分 (まだ答えていない回) を誤答として数える
+RECENT_HISTORY_LIMIT = 25
+RECENT_HISTORY_DECAY = 0.841
+# 出題モード → 使うスコア。begin_quiz_set() で選ぶ
+SCORE_MODES = ("incorrect", "unlearned")
 # 類義語・対義語を文字列だけで登録すると英単語自体が意味になるため、出題対象から除外する
 HAS_REAL_MEANING = "m.meaning_ja != w.word"
 CHOICE_POOL_SIZE = 30
 # 活用クイズの重みの下限。正解し続けた動詞・人称・時制でもたまには出す (未回答の組み合わせは 0.5³ = 0.125)
 MIN_CONJUGATION_WEIGHT = 0.01
+# 長いセットでは、この問題数ごとに活用クイズの重みを回答履歴から計算し直す
+WEIGHT_REFRESH_INTERVAL = 50
 SIMILAR_MEANING_RATIO = 0.6
 MEANING_SEPARATOR = "\x1f"
 ANNOTATION_PATTERN = re.compile(r"[〈（(［\[《][^〉）)］\]》]*[〉）)］\]》]")
@@ -101,6 +110,8 @@ class QuizScope:
     sources: tuple[str, ...] = ()
     difficulties: tuple[str, ...] = ()
     parts_of_speech: tuple[str, ...] = ()
+    # 取り込んだJSONファイル (教材フォルダからの相対パス)
+    files: tuple[str, ...] = ()
 
     def condition(self, word: str = "w", meaning: str = "m", part: str = "p") -> tuple[str, tuple]:
         # 出典・レベルは意味ごとに判定する。A1 の aber (接続詞) と A2 の aber (心態詞) をレベルで出し分けるため
@@ -108,7 +119,7 @@ class QuizScope:
         if self.parts_of_speech:
             clauses.append(f"{part}.name IN ({', '.join('?' for _ in self.parts_of_speech)})")
             params += self.parts_of_speech
-        if self.sources or self.difficulties:
+        if self.sources or self.difficulties or self.files:
             entry_clauses = [f"em.meaning_id = {meaning}.id"]
             if self.sources:
                 entry_clauses.append(f"s.name IN ({', '.join('?' for _ in self.sources)})")
@@ -116,6 +127,11 @@ class QuizScope:
             if self.difficulties:
                 entry_clauses.append(f"e.difficulty IN ({', '.join('?' for _ in self.difficulties)})")
                 params += self.difficulties
+            if self.files:
+                entry_clauses.append(
+                    f"EXISTS (SELECT 1 FROM entry_files ef WHERE ef.entry_id = e.id AND ef.file IN ({', '.join('?' for _ in self.files)}))"
+                )
+                params += self.files
             clauses.append(
                 "EXISTS (SELECT 1 FROM entry_meanings em JOIN entries e ON e.id = em.entry_id"
                 f" JOIN sources s ON s.id = e.source_id WHERE {' AND '.join(entry_clauses)})"
@@ -123,17 +139,43 @@ class QuizScope:
         return " AND ".join(clauses), tuple(params)
 
 
-class CleanupReport(NamedTuple):
-    """JSONとの照合で消える (消えた) もの"""
-    # JSONにない見出し: (単語, 言語, 出典, レベル)
-    entries: list[tuple[str, str, str, str]]
-    # どの見出しにも属さず、類義語・派生語としても参照されていない単語: (単語, 言語, 回答履歴の件数)
-    words: list[tuple[str, str, int]]
+class SyncReport(NamedTuple):
+    """JSONとの照合結果。DBをJSONから作り直したときに消える (removed) もの・増える (added) もの"""
+    # 単語: (言語, 単語, 回答履歴の件数)。増える単語の履歴は 0
+    removed_words: list[tuple[str, str, int]]
+    added_words: list[tuple[str, str, int]]
+    # 見出し: (言語, 単語, 出典, レベル)
+    removed_entries: list[tuple[str, str, str, str]]
+    added_entries: list[tuple[str, str, str, str]]
+    # 意味: (言語, 単語, 品詞, 意味)
+    removed_meanings: list[tuple[str, str, str, str]]
+    added_meanings: list[tuple[str, str, str, str]]
+    # 例文: (言語, 単語, 例文)
+    removed_examples: list[tuple[str, str, str]]
+    added_examples: list[tuple[str, str, str]]
+    # 語形・格支配・訳・類義語など、上の一覧に出ない中身の違いがあるか
+    other_changes: bool
+    # 綴りを直したとみなす単語: (言語, 古い綴り, 新しい綴り, 回答履歴の件数)。回答履歴は新しい綴りに引き継ぐ
+    renamed_words: list[tuple[str, str, str, int]]
+
+    @property
+    def changed(self) -> bool:
+        return self.other_changes or any(self[:8]) or bool(self.renamed_words)
+
+
+# JSONとの照合で、消える単語と増える単語の綴りがこれ以上似ていれば綴りの修正とみなす (anntotate → annotate)
+RENAME_SIMILARITY = 0.85
+# JSONとの照合で作り直す表 (回答履歴以外)
+CONTENT_TABLES = (
+    "sources", "words", "entries", "entry_files", "parts_of_speech", "meanings", "examples",
+    "entry_meanings", "entry_examples", "word_relations", "meaning_relations", "derivations",
+)
 
 
 @dataclass
 class ImportedEntry:
-    """1回の取り込みで見出し (単語×出典×レベル) に含まれていた品詞・意味・例文"""
+    """1回の取り込みで見出し (単語×出典×レベル) に含まれていた品詞・意味・例文。
+    meaning_ids には派生語の意味も含む (派生語は派生元の見出しの出典・レベル・ファイルで出題範囲に入る)"""
     part_ids: set[int] = field(default_factory=set)
     meaning_ids: set[int] = field(default_factory=set)
     sentences: set[str] = field(default_factory=set)
@@ -148,9 +190,33 @@ def history_pool(question_type: str) -> str:
     return question_type if question_type in SEPARATE_POOL_TYPES else MEANING_POOL
 
 
+def incorrect_score(results: list[bool]) -> float | None:
+    """誤答スコア (0〜1)。results は正誤を新しい順に並べたもの (直近 RECENT_HISTORY_LIMIT 回まで使う)。
+    Σ(誤答 × DECAYⁿ) / ΣDECAYⁿ (n は最新が 0、答えた回の分だけ)。回答がなければ None"""
+    results = results[:RECENT_HISTORY_LIMIT]
+    if not results:
+        return None
+    weights = [RECENT_HISTORY_DECAY ** n for n in range(len(results))]
+    return sum(weight for weight, correct in zip(weights, results) if not correct) / sum(weights)
+
+
+def unlearned_score(results: list[bool]) -> float:
+    """未習得スコア (0〜1)。results は正誤を新しい順に並べたもの (直近 RECENT_HISTORY_LIMIT 回まで使う)。
+    Σ(誤答 × DECAYⁿ) / ΣDECAYⁿ (n は最新が 0、n = RECENT_HISTORY_LIMIT - 1 まで)。
+    回答が足りない古い側の回は誤答とするので、未回答の単語は 1、正解し続けて RECENT_HISTORY_LIMIT 回で 0 になる"""
+    results = results[:RECENT_HISTORY_LIMIT]
+    weights = [RECENT_HISTORY_DECAY ** n for n in range(RECENT_HISTORY_LIMIT)]
+    learned = sum(weight for weight, correct in zip(weights, results) if correct)
+    return 1.0 - learned / sum(weights)
+
+
 class PoolStats(NamedTuple):
     answered: int = 0
     correct: int = 0
+    # 誤答スコア (incorrect_score)。回答がなければ None
+    incorrect: float | None = None
+    # 未習得スコア (unlearned_score)。回答がなければ 1
+    unlearned: float = 1.0
 
     @property
     def accuracy(self) -> float | None:
@@ -221,14 +287,21 @@ class LexiconDatabase:
         self.connection.row_factory = sqlite3.Row
         # 1セットの間だけ固定する出題の重み。begin_quiz_set() で作り直す。None なら毎回計算する
         self._set_weights: dict | None = None
+        # 出題の重みに使うスコア (SCORE_MODES)
+        self.score_mode = "unlearned"
 
     def close(self) -> None:
         self.connection.close()
 
-    def begin_quiz_set(self) -> None:
-        """新しいセットを始める。活用クイズの重みはセットの最初の出題時に回答履歴から計算し、セットの間は固定する
-        (直前に間違えた形ばかり続けて出ないように)"""
+    def begin_quiz_set(self, score_mode: str = "unlearned") -> None:
+        """新しいセットを始める。score_mode は出題の重みに使うスコア (誤答スコア / 未習得スコア)。
+        活用クイズの重みはセットの最初の出題時に回答履歴から計算し、
+        WEIGHT_REFRESH_INTERVAL 問ごとに計算し直す。その間は固定する (直前に間違えた形ばかり続けて出ないように)"""
+        if score_mode not in SCORE_MODES:
+            raise ValueError(f"出題モードは {' / '.join(SCORE_MODES)} のどれかにしてください: {score_mode}")
         self._set_weights = {}
+        self.score_mode = score_mode
+
 
     def initialize(self) -> None:
         self._migrate_legacy_schema()
@@ -246,6 +319,11 @@ class LexiconDatabase:
                 id INTEGER PRIMARY KEY, word_id INTEGER NOT NULL, source_id INTEGER NOT NULL, difficulty TEXT NOT NULL DEFAULT '',
                 UNIQUE(word_id, source_id, difficulty),
                 FOREIGN KEY (word_id) REFERENCES words(id) ON DELETE CASCADE, FOREIGN KEY (source_id) REFERENCES sources(id)
+            );
+            -- 見出しがどのJSONファイルから取り込まれたか (教材フォルダからの相対パス)。出題範囲をファイルで選ぶのに使う
+            CREATE TABLE IF NOT EXISTS entry_files (
+                entry_id INTEGER NOT NULL, file TEXT NOT NULL, PRIMARY KEY (entry_id, file),
+                FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS parts_of_speech (
                 id INTEGER PRIMARY KEY, word_id INTEGER NOT NULL, name TEXT NOT NULL,
@@ -305,6 +383,19 @@ class LexiconDatabase:
         # words を作り直す移行のあとで列を足す
         self._migrate_entries()
         self._add_missing_columns()
+        # 出題範囲の絞り込み (意味 → 見出し) と回答履歴の集計で引く列。移行で表を作り直したあとに作る
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS entry_meanings_meaning ON entry_meanings(meaning_id);
+            CREATE INDEX IF NOT EXISTS entry_examples_example ON entry_examples(example_id);
+            CREATE INDEX IF NOT EXISTS entries_word ON entries(word_id);
+            CREATE INDEX IF NOT EXISTS derivations_word ON derivations(word_id);
+            CREATE INDEX IF NOT EXISTS derivations_derived_word ON derivations(derived_word_id);
+            CREATE INDEX IF NOT EXISTS meaning_relations_related ON meaning_relations(related_meaning_id);
+            CREATE INDEX IF NOT EXISTS answer_history_type_word ON answer_history(question_type, word_id, id);
+            CREATE INDEX IF NOT EXISTS answer_history_word ON answer_history(word_id);
+            """
+        )
         self.connection.commit()
 
     def _migrate_entries(self) -> None:
@@ -457,85 +548,149 @@ class LexiconDatabase:
         self.connection.commit()
         self.connection.execute("PRAGMA foreign_keys = ON")
 
+    def sync_with_json(
+        self, json_files: list[tuple[Path, str]], apply: bool, transfers: dict[tuple[str, str], str] | None = None,
+    ) -> SyncReport:
+        """DBの単語データを、JSONファイル (パス, ファイル名) をすべて新しいDBに取り込んだものと照合する。
+        apply=True なら単語データをそれに置き換え、回答履歴は同じ単語 (見出し語×言語) に付け替える。
+        消える単語の回答履歴は transfers {(言語, 消える単語): 引き継ぐ単語} の単語に引き継ぎ、それ以外は消える。
+        transfers を省略すると、綴りを直したとみなした単語 (renamed_words) だけ引き継ぐ。
+        取り込みの順番は json_files の順 (語形などは後のファイルが優先)"""
+        with tempfile.TemporaryDirectory() as directory:
+            fresh = LexiconDatabase(Path(directory) / "fresh.db")
+            try:
+                fresh.initialize()
+                for path, label in json_files:
+                    try:
+                        fresh.import_json(path, label)
+                    except ValueError as error:
+                        raise ValueError(f"{label}: {error}") from None
+            finally:
+                fresh.close()
+            self.connection.execute("ATTACH DATABASE ? AS fresh", (str(Path(directory) / "fresh.db"),))
+            try:
+                report = self._sync_report()
+                if apply and report.changed:
+                    if transfers is None:
+                        transfers = {(language, old): new for language, old, new, _ in report.renamed_words}
+                    self._replace_content(transfers)
+            except Exception:
+                self.connection.rollback()
+                raise
+            finally:
+                self.connection.commit()
+                self.connection.execute("DETACH DATABASE fresh")
+        return report
+
+    def _sync_report(self) -> SyncReport:
+        def diff(query: str) -> tuple[list, list]:
+            current = {tuple(row) for row in self.connection.execute(query.format(db="main"))}
+            new = {tuple(row) for row in self.connection.execute(query.format(db="fresh"))}
+            return sorted(current - new, key=str), sorted(new - current, key=str)
+
+        removed_words, added_words = diff("SELECT language, word FROM {db}.words")
+        history = {
+            (row["language"], row["word"]): row["history"]
+            for row in self.connection.execute(
+                "SELECT w.language, w.word, COUNT(*) AS history FROM answer_history h JOIN main.words w ON w.id = h.word_id GROUP BY w.id"
+            )
+        }
+        entries = diff(
+            "SELECT w.language, w.word, s.name, e.difficulty FROM {db}.entries e"
+            " JOIN {db}.words w ON w.id = e.word_id JOIN {db}.sources s ON s.id = e.source_id"
+        )
+        meanings = diff(
+            "SELECT w.language, w.word, p.name, m.meaning_ja FROM {db}.meanings m"
+            " JOIN {db}.parts_of_speech p ON p.id = m.part_of_speech_id JOIN {db}.words w ON w.id = p.word_id"
+        )
+        examples = diff("SELECT w.language, w.word, x.sentence FROM {db}.examples x JOIN {db}.words w ON w.id = x.word_id")
+        # 一覧に出ない違い: 語形・格支配・訳・ターゲット・類義語・派生語・取り込み元のファイル
+        details = [
+            diff("SELECT w.language, w.word, p.name, m.meaning_ja, m.forms, m.valency FROM {db}.meanings m"
+                 " JOIN {db}.parts_of_speech p ON p.id = m.part_of_speech_id JOIN {db}.words w ON w.id = p.word_id"),
+            diff("SELECT w.language, w.word, x.sentence, x.translation_ja, x.targets, x.valency FROM {db}.examples x"
+                 " JOIN {db}.words w ON w.id = x.word_id"),
+            diff("SELECT w.language, w.word, w.separable_prefix FROM {db}.words w"),
+            diff("SELECT a.language, a.word, am.meaning_ja, r.relation_type, b.word, bm.meaning_ja FROM {db}.meaning_relations r"
+                 " JOIN {db}.meanings am ON am.id = r.meaning_id JOIN {db}.parts_of_speech ap ON ap.id = am.part_of_speech_id"
+                 " JOIN {db}.words a ON a.id = ap.word_id JOIN {db}.meanings bm ON bm.id = r.related_meaning_id"
+                 " JOIN {db}.parts_of_speech bp ON bp.id = bm.part_of_speech_id JOIN {db}.words b ON b.id = bp.word_id"),
+            diff("SELECT a.language, a.word, b.word, d.part_of_speech FROM {db}.derivations d"
+                 " JOIN {db}.words a ON a.id = d.word_id JOIN {db}.words b ON b.id = d.derived_word_id"),
+            diff("SELECT w.language, w.word, s.name, e.difficulty, mw.word, m.meaning_ja FROM {db}.entry_meanings em"
+                 " JOIN {db}.entries e ON e.id = em.entry_id JOIN {db}.words w ON w.id = e.word_id JOIN {db}.sources s ON s.id = e.source_id"
+                 " JOIN {db}.meanings m ON m.id = em.meaning_id JOIN {db}.parts_of_speech mp ON mp.id = m.part_of_speech_id"
+                 " JOIN {db}.words mw ON mw.id = mp.word_id"),
+            diff("SELECT w.language, w.word, s.name, e.difficulty, f.file FROM {db}.entry_files f JOIN {db}.entries e ON e.id = f.entry_id"
+                 " JOIN {db}.words w ON w.id = e.word_id JOIN {db}.sources s ON s.id = e.source_id"),
+        ]
+        renamed = self._find_renames(removed_words, added_words)
+        renamed_old = {(language, old) for language, old, _ in renamed}
+        renamed_new = {(language, new) for language, _, new in renamed}
+        return SyncReport(
+            [(language, word, history.get((language, word), 0)) for language, word in removed_words if (language, word) not in renamed_old],
+            [(language, word, 0) for language, word in added_words if (language, word) not in renamed_new],
+            *entries, *meanings, *examples,
+            any(removed or added for removed, added in details),
+            [(language, old, new, history.get((language, old), 0)) for language, old, new in renamed],
+        )
+
     @staticmethod
-    def json_entry_keys(json_paths: list[Path]) -> set[tuple[str, str, str, str]]:
-        """JSONにある見出しの (単語, 言語, 出典, レベル)。取り込み時と同じ既定値・正規化をする"""
-        keys = set()
-        for json_path in json_paths:
-            with json_path.open(encoding="utf-8") as file:
-                payload = json.load(file)
-            for entry in [payload] if isinstance(payload, dict) else payload:
-                if isinstance(entry, dict) and isinstance(entry.get("word"), str):
-                    keys.add((
-                        split_separable(entry["word"].strip())[0], entry.get("language", "English"),
-                        entry.get("source", "JSON"), (entry.get("difficulty") or "").strip(),
-                    ))
-        return keys
+    def _find_renames(removed: list[tuple[str, str]], added: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
+        """消える単語と増える単語のうち、綴りがよく似た1対1の組 (綴りの修正) を探す"""
+        def best(word: tuple[str, str], candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
+            scored = [
+                (SequenceMatcher(None, word[1].casefold(), other[1].casefold()).ratio(), other)
+                for other in candidates if other[0] == word[0]
+            ]
+            scored = [item for item in scored if item[0] >= RENAME_SIMILARITY]
+            if not scored:
+                return None
+            scored.sort(reverse=True)
+            # 同じくらい似た候補が2つ以上あるときは決めない
+            return scored[0][1] if len(scored) == 1 or scored[1][0] < scored[0][0] else None
 
-    def remove_missing_entries(self, json_paths: list[Path], apply: bool) -> CleanupReport:
-        """DBにあってJSONのどこにもない見出しを消し、どの見出しにも属さなくなった単語を回答履歴ごと消す。
-        apply=False なら何が消えるかだけを返して元に戻す"""
-        keys = self.json_entry_keys(json_paths)
-        rows = self.connection.execute(
-            """
-            SELECT e.id, e.word_id, w.word, w.language, s.name AS source, e.difficulty
-            FROM entries e JOIN words w ON w.id = e.word_id JOIN sources s ON s.id = e.source_id
-            ORDER BY w.language, w.word
-            """
-        ).fetchall()
-        missing = [row for row in rows if (row["word"], row["language"], row["source"], row["difficulty"]) not in keys]
+        return [
+            (old[0], old[1], new[1])
+            for old in removed
+            if (new := best(old, added)) is not None and best(new, removed) == old
+        ]
+
+    def _replace_content(self, transfers: dict[tuple[str, str], str]) -> None:
+        """単語データを attach した fresh のものに置き換え、回答履歴の単語IDを付け替える。
+        transfers {(言語, 消える単語): 引き継ぐ単語} の回答履歴は引き継ぐ単語に付け替える"""
+        self.connection.commit()
+        self.connection.execute("PRAGMA foreign_keys = OFF")
         try:
-            for row in missing:
-                self.connection.execute("DELETE FROM entries WHERE id=?", (row["id"],))
-            for word_id in {row["word_id"] for row in missing}:
-                self._collect_unlinked(word_id)
-            deleted_words = self._delete_unused_words()
-        except Exception:
-            self.connection.rollback()
-            raise
-        if apply:
+            self.connection.execute("DROP TABLE IF EXISTS temp.word_map")
+            self.connection.execute(
+                "CREATE TEMP TABLE word_map AS SELECT o.id AS old_id, n.id AS new_id"
+                " FROM main.words o JOIN fresh.words n ON n.word = o.word AND n.language = o.language"
+            )
+            for (language, old), new in transfers.items():
+                self.connection.execute(
+                    "INSERT INTO temp.word_map SELECT o.id, n.id FROM main.words o JOIN fresh.words n ON n.language = o.language"
+                    " WHERE o.language = ? AND o.word = ? AND n.word = ?",
+                    (language, old, new),
+                )
+            for table in CONTENT_TABLES:
+                columns = [row[1] for row in self.connection.execute(f"PRAGMA fresh.table_info({table})")]
+                current = {row[1] for row in self.connection.execute(f"PRAGMA main.table_info({table})")}
+                columns = ", ".join(column for column in columns if column in current)
+                self.connection.execute(f"DELETE FROM main.{table}")
+                self.connection.execute(f"INSERT INTO main.{table} ({columns}) SELECT {columns} FROM fresh.{table}")
+            self.connection.execute("DELETE FROM answer_history WHERE word_id NOT IN (SELECT old_id FROM temp.word_map)")
+            self.connection.execute(
+                "UPDATE answer_history SET word_id = (SELECT new_id FROM temp.word_map WHERE old_id = answer_history.word_id)"
+            )
+            self.connection.execute("DROP TABLE temp.word_map")
             self.connection.commit()
-        else:
-            self.connection.rollback()
-        return CleanupReport([(row["word"], row["language"], row["source"], row["difficulty"]) for row in missing], deleted_words)
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
 
-    def _collect_unlinked(self, word_id: int) -> None:
-        """どの見出しにも属さなくなった意味・例文・品詞を消す。他の単語の類義語として参照されている意味は残す"""
-        self.connection.execute(
-            """
-            DELETE FROM meanings
-            WHERE part_of_speech_id IN (SELECT id FROM parts_of_speech WHERE word_id=?)
-              AND id NOT IN (SELECT meaning_id FROM entry_meanings)
-              AND id NOT IN (SELECT related_meaning_id FROM meaning_relations)
-            """,
-            (word_id,),
-        )
-        self.connection.execute(
-            "DELETE FROM parts_of_speech WHERE word_id=? AND NOT EXISTS (SELECT 1 FROM meanings WHERE part_of_speech_id = parts_of_speech.id)",
-            (word_id,),
-        )
-        self.connection.execute("DELETE FROM examples WHERE word_id=? AND id NOT IN (SELECT example_id FROM entry_examples)", (word_id,))
-
-    def _delete_unused_words(self) -> list[tuple[str, str, int]]:
-        """見出しがなく、類義語・派生語としても参照されていない単語を消す (回答履歴も消える)。消した (単語, 言語, 履歴件数) を返す"""
-        rows = self.connection.execute(
-            """
-            SELECT w.id, w.word, w.language, (SELECT COUNT(*) FROM answer_history h WHERE h.word_id = w.id) AS history
-            FROM words w
-            WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.word_id = w.id)
-              AND NOT EXISTS (SELECT 1 FROM derivations d WHERE d.derived_word_id = w.id)
-              AND NOT EXISTS (
-                  SELECT 1 FROM meaning_relations mr JOIN meanings m ON m.id = mr.related_meaning_id
-                  JOIN parts_of_speech p ON p.id = m.part_of_speech_id WHERE p.word_id = w.id
-              )
-            ORDER BY w.language, w.word
-            """
-        ).fetchall()
-        for row in rows:
-            self.connection.execute("DELETE FROM words WHERE id=?", (row["id"],))
-        return [(row["word"], row["language"], row["history"]) for row in rows]
-
-    def import_json(self, json_path: Path) -> int:
+    def import_json(self, json_path: Path, file_label: str | None = None) -> int:
+        """JSONを取り込む。file_label は出題範囲の「ファイル」に出す名前 (省略時はファイル名)"""
+        file_label = file_label or json_path.name
         with json_path.open(encoding="utf-8") as file:
             payload = json.load(file)
 
@@ -546,8 +701,10 @@ class LexiconDatabase:
         # 同じファイルに同じ見出しが複数あってもまとめて扱えるよう、不要になった意味などの削除は最後に行う
         imported: dict[int, ImportedEntry] = {}
         try:
+            # ファイルから消えた見出しのひも付けも外れるよう、このファイルの分は作り直す
+            self.connection.execute("DELETE FROM entry_files WHERE file=?", (file_label,))
             for entry in entries:
-                self._import_entry(entry, imported)
+                self._import_entry(entry, imported, file_label)
             for entry_id, contents in imported.items():
                 self._prune_entry(entry_id, contents)
         except Exception:
@@ -556,7 +713,7 @@ class LexiconDatabase:
         self.connection.commit()
         return len(entries)
 
-    def _import_entry(self, entry: dict, imported: dict[int, ImportedEntry]) -> None:
+    def _import_entry(self, entry: dict, imported: dict[int, ImportedEntry], file_label: str = "") -> None:
         # JSONの見出し (単語×出典×レベル) を正とし、JSONから消えた意味・例文・関連はDBからも消す。
         # 同じ単語でも別の出典・レベルの見出しにだけある意味は残す
         word = entry.get("word")
@@ -579,6 +736,8 @@ class LexiconDatabase:
         entry_id = self.connection.execute(
             "SELECT id FROM entries WHERE word_id=? AND source_id=? AND difficulty=?", (word_id, source_id, difficulty)
         ).fetchone()[0]
+        if file_label:
+            self.connection.execute("INSERT OR IGNORE INTO entry_files(entry_id, file) VALUES (?, ?)", (entry_id, file_label))
         if entry_id not in imported:
             self._clear_outgoing_links(entry_id)
             imported[entry_id] = ImportedEntry()
@@ -669,9 +828,15 @@ class LexiconDatabase:
             contents.sentences.add(self._insert_example(word, word_id, entry_id, example))
 
         for derivative in normalize_derivatives(entry):
-            derived_word_id, _ = self._ensure_word_meaning(
+            derived_word_id, derived_meaning_id = self._ensure_word_meaning(
                 derivative["word"], language, derivative["part_of_speech"], derivative.get("meaning_ja")
             )
+            # 派生語の意味も派生元の見出しにひも付け、出典・レベル・ファイルを共通にする
+            if derived_meaning_id is not None:
+                contents.meaning_ids.add(derived_meaning_id)
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO entry_meanings(entry_id, meaning_id) VALUES (?, ?)", (entry_id, derived_meaning_id)
+                )
             if derived_word_id != word_id:
                 self.connection.execute(
                     "INSERT OR IGNORE INTO derivations(word_id, derived_word_id, part_of_speech, entry_id) VALUES (?, ?, ?, ?)",
@@ -679,8 +844,16 @@ class LexiconDatabase:
                 )
 
     def _clear_outgoing_links(self, entry_id: int) -> None:
+        # 見出し語自身の意味の類義語だけを消す。派生語の意味の類義語は、その語自身の見出しのもの
         self.connection.execute(
-            "DELETE FROM meaning_relations WHERE meaning_id IN (SELECT meaning_id FROM entry_meanings WHERE entry_id=?)", (entry_id,)
+            """
+            DELETE FROM meaning_relations WHERE meaning_id IN (
+                SELECT em.meaning_id FROM entry_meanings em JOIN meanings m ON m.id = em.meaning_id
+                JOIN parts_of_speech p ON p.id = m.part_of_speech_id JOIN entries e ON e.id = em.entry_id
+                WHERE em.entry_id=? AND p.word_id = e.word_id
+            )
+            """,
+            (entry_id,),
         )
         self.connection.execute("DELETE FROM derivations WHERE entry_id=?", (entry_id,))
 
@@ -689,6 +862,14 @@ class LexiconDatabase:
         # 類義語・派生語として名前だけ作られた意味 (見出しなし) もここで消える
         word_id = self.connection.execute("SELECT word_id FROM entries WHERE id=?", (entry_id,)).fetchone()[0]
         meaning_ids, sentences = tuple(contents.meaning_ids), tuple(contents.sentences)
+        # 見出し語と、この見出しに意味がひも付いている (いた) 派生語。外れた意味をあとで消す
+        word_ids = {word_id} | {
+            row[0] for row in self.connection.execute(
+                "SELECT DISTINCT p.word_id FROM meanings m JOIN parts_of_speech p ON p.id = m.part_of_speech_id"
+                f" WHERE m.id IN (SELECT meaning_id FROM entry_meanings WHERE entry_id=?) OR m.id IN ({', '.join('?' for _ in meaning_ids)})",
+                (entry_id, *meaning_ids),
+            )
+        }
         self.connection.execute(
             f"DELETE FROM entry_meanings WHERE entry_id=? AND meaning_id NOT IN ({', '.join('?' for _ in meaning_ids)})",
             (entry_id, *meaning_ids),
@@ -702,13 +883,13 @@ class LexiconDatabase:
         )
         # 他の単語の類義語・対義語として参照されている意味は残す
         self.connection.execute(
-            """
+            f"""
             DELETE FROM meanings
-            WHERE part_of_speech_id IN (SELECT id FROM parts_of_speech WHERE word_id=?)
+            WHERE part_of_speech_id IN (SELECT id FROM parts_of_speech WHERE word_id IN ({', '.join('?' for _ in word_ids)}))
               AND id NOT IN (SELECT meaning_id FROM entry_meanings)
               AND id NOT IN (SELECT related_meaning_id FROM meaning_relations)
             """,
-            (word_id,),
+            tuple(word_ids),
         )
         self.connection.execute(
             f"""
@@ -786,7 +967,7 @@ class LexiconDatabase:
         ).fetchone()[0]
 
     def _ensure_word_meaning(self, word: str, language: str, part_of_speech: str, meaning_ja: str | None) -> tuple[int, int | None]:
-        # 類義語・派生語として名前だけ登録する。見出しにはしないので、出典・レベルで絞り込んだ出題には出ない
+        # 類義語・派生語として名前だけ登録する。見出しにはしない (派生語の意味は呼び出し側で派生元の見出しにひも付ける)
         word_id = self._ensure_word(word, language)
         part_id = self._ensure_part_of_speech(word_id, part_of_speech)
         return word_id, self._ensure_meaning(part_id, meaning_ja) if meaning_ja else None
@@ -961,17 +1142,7 @@ class LexiconDatabase:
         scope_condition, scope_params = scope.condition()
         rows = self.connection.execute(
             f"""
-            SELECT w.id, w.word, w.language, w.separable_prefix, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency,
-                COALESCE((
-                    SELECT AVG(CASE WHEN recent.is_correct = 0 THEN 1.0 ELSE 0.0 END)
-                    FROM (
-                        SELECT h.is_correct
-                        FROM answer_history h
-                        WHERE h.word_id = w.id AND h.question_type = ?
-                        ORDER BY h.id DESC
-                        LIMIT ?
-                    ) AS recent
-                ), 0.0) AS incorrect_rate
+            SELECT w.id, w.word, w.language, w.separable_prefix, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency
             FROM words w
             JOIN parts_of_speech p ON p.word_id = w.id
             JOIN meanings m ON m.part_of_speech_id = p.id
@@ -980,19 +1151,43 @@ class LexiconDatabase:
             GROUP BY w.id, m.id
             ORDER BY RANDOM()
             """,
-            (question_type, RECENT_HISTORY_LIMIT, *scope_params),
+            scope_params,
         ).fetchall()
         if not rows:
             raise ValueError("出題範囲の条件に合う単語データがありません")
-        return random.choices(rows, weights=[1.0 + 5.0 * row["incorrect_rate"] for row in rows], k=1)[0]
+        scores = self._word_scores(question_type)
+        return random.choices(rows, weights=[1.0 + 5.0 * scores[row["id"]] for row in rows], k=1)[0]
+
+    def _word_scores(self, question_type: str) -> defaultdict[int, float]:
+        """出題モードのスコアを単語ごとに返す。回答のない単語は、誤答スコアなら 0、未習得スコアなら 1"""
+        results = self._recent_results("h.question_type = ?", (question_type,))
+        if self.score_mode == "unlearned":
+            return defaultdict(lambda: 1.0, {word_id: unlearned_score(values) for (word_id, _), values in results.items()})
+        return defaultdict(float, {word_id: incorrect_score(values) for (word_id, _), values in results.items()})
+
+    def _recent_results(self, where: str, params: tuple, pool: str = "''") -> dict[tuple[int, str], list[bool]]:
+        """(単語, 集計単位) ごとの直近 RECENT_HISTORY_LIMIT 回の正誤を新しい順に返す"""
+        results: dict[tuple[int, str], list[bool]] = {}
+        for row in self.connection.execute(
+            f"""
+            SELECT word_id, pool, is_correct FROM (
+                SELECT h.word_id, {pool} AS pool, h.is_correct,
+                    ROW_NUMBER() OVER (PARTITION BY h.word_id, {pool} ORDER BY h.id DESC) AS position
+                FROM answer_history h JOIN words w ON w.id = h.word_id WHERE {where}
+            ) WHERE position <= ? ORDER BY word_id, pool, position
+            """,
+            (*params, RECENT_HISTORY_LIMIT),
+        ):
+            results.setdefault((row["word_id"], row["pool"]), []).append(bool(row["is_correct"]))
+        return results
 
     def languages(self) -> list[str]:
         """登録されている言語を単語数の多い順に返す"""
         rows = self.connection.execute("SELECT language FROM words GROUP BY language ORDER BY COUNT(*) DESC, language").fetchall()
         return [row[0] for row in rows]
 
-    def scope_options(self, language: str) -> tuple[list[str], list[str], list[str]]:
-        """その言語で選べる出典・レベル・品詞を返す。品詞は見出し語の意味が多い順"""
+    def scope_options(self, language: str) -> tuple[list[str], list[str], list[str], list[str]]:
+        """その言語で選べる出典・レベル・品詞・ファイルを返す。品詞は見出し語の意味が多い順"""
         sources = self.connection.execute(
             "SELECT DISTINCT s.name FROM entries e JOIN words w ON w.id = e.word_id JOIN sources s ON s.id = e.source_id"
             " WHERE w.language=? ORDER BY s.name",
@@ -1013,7 +1208,12 @@ class LexiconDatabase:
             """,
             (language,),
         ).fetchall()
-        return [row[0] for row in sources], [row[0] for row in difficulties], [row[0] for row in parts_of_speech]
+        files = self.connection.execute(
+            "SELECT DISTINCT f.file FROM entry_files f JOIN entries e ON e.id = f.entry_id JOIN words w ON w.id = e.word_id"
+            " WHERE w.language=? ORDER BY f.file",
+            (language,),
+        ).fetchall()
+        return [row[0] for row in sources], [row[0] for row in difficulties], [row[0] for row in parts_of_speech], [row[0] for row in files]
 
     def create_question(self, question_type: str, show_hint: bool = False, scope: QuizScope | None = None) -> Question:
         scope = scope or QuizScope()
@@ -1212,11 +1412,13 @@ class LexiconDatabase:
         例: ab|fahren 出発する ｜ du・現在 → fährst ab
         出題は 動詞の誤り率 × 人称の誤り率 × 時制の誤り率 に比例させ、苦手な人称・時制を別の動詞でも練習させる"""
         key = ("conjugation", scope)
-        candidates = self._set_weights.get(key) if self._set_weights is not None else None
-        if candidates is None:
-            candidates = self._conjugation_candidates(scope)
-            if self._set_weights is not None:
-                self._set_weights[key] = candidates
+        # (候補と重み, 計算してから出した問題数)。WEIGHT_REFRESH_INTERVAL 問出したら計算し直す
+        cached = self._set_weights.get(key) if self._set_weights is not None else None
+        if cached is None or cached[1] >= WEIGHT_REFRESH_INTERVAL:
+            cached = (self._conjugation_candidates(scope), 0)
+        candidates = cached[0]
+        if self._set_weights is not None:
+            self._set_weights[key] = (candidates, cached[1] + 1)
         if not candidates:
             raise ValueError("出題範囲に、活用クイズにできる動詞 (現在形・過去形などが登録された動詞) がありません")
         target, cell, spec = random.choices([candidate[:3] for candidate in candidates], weights=[candidate[3] for candidate in candidates], k=1)[0]
@@ -1302,24 +1504,30 @@ class LexiconDatabase:
         return {(row["person"], row["tense"]): PoolStats(row["answered"], row["correct"]) for row in rows}
 
     def word_stats(self, language: str, meaning_question_type: str | None = None) -> list[WordStats]:
-        """その言語の単語ごとの回答数・正答数を、意味・性・複数形・転写の集計単位ごとに返す。
+        """その言語の単語ごとの回答数・正答数・誤答スコア・未習得スコアを、意味・性・複数形・転写の集計単位ごとに返す。
         meaning_question_type を指定すると、意味の集計はその問題形式 (穴埋めだけなど) の回答だけを数える。
         類義語などとして名前だけ登録された語 (意味がない語) は含めない"""
         separate = ", ".join(f"'{question_type}'" for question_type in SEPARATE_POOL_TYPES)
+        pool = f"CASE WHEN h.question_type IN ({separate}) THEN h.question_type ELSE '{MEANING_POOL}' END"
+        where = f"w.language = ? AND (h.question_type IN ({separate}) OR ? IS NULL OR h.question_type = ?)"
+        params = (language, meaning_question_type, meaning_question_type)
+        recent = self._recent_results(where, params, pool)
         history: dict[int, dict[str, PoolStats]] = {}
         last_answered: dict[int, str] = {}
         for row in self.connection.execute(
             f"""
-            SELECT h.word_id,
-                CASE WHEN h.question_type IN ({separate}) THEN h.question_type ELSE '{MEANING_POOL}' END AS pool,
+            SELECT h.word_id, {pool} AS pool,
                 COUNT(*) AS answered, SUM(h.is_correct) AS correct, MAX(h.answered_at) AS last_answered
             FROM answer_history h JOIN words w ON w.id = h.word_id
-            WHERE w.language = ? AND (h.question_type IN ({separate}) OR ? IS NULL OR h.question_type = ?)
+            WHERE {where}
             GROUP BY h.word_id, pool
             """,
-            (language, meaning_question_type, meaning_question_type),
+            params,
         ):
-            history.setdefault(row["word_id"], {})[row["pool"]] = PoolStats(row["answered"], row["correct"])
+            results = recent.get((row["word_id"], row["pool"]), [])
+            history.setdefault(row["word_id"], {})[row["pool"]] = PoolStats(
+                row["answered"], row["correct"], incorrect_score(results), unlearned_score(results)
+            )
             last_answered[row["word_id"]] = max(last_answered.get(row["word_id"], ""), row["last_answered"])
         rows = self.connection.execute(
             f"""
@@ -1331,7 +1539,11 @@ class LexiconDatabase:
                     WHERE p.word_id = w.id AND {HAS_REAL_MEANING}) AS has_meaning,
                 (SELECT GROUP_CONCAT(label, ', ') FROM (
                     SELECT DISTINCT s.name || CASE WHEN e.difficulty != '' THEN ' (' || e.difficulty || ')' ELSE '' END AS label
-                    FROM entries e JOIN sources s ON s.id = e.source_id WHERE e.word_id = w.id)) AS sources
+                    FROM entries e JOIN sources s ON s.id = e.source_id
+                    WHERE e.word_id = w.id OR e.id IN (
+                        SELECT em.entry_id FROM entry_meanings em JOIN meanings m ON m.id = em.meaning_id
+                        JOIN parts_of_speech p ON p.id = m.part_of_speech_id WHERE p.word_id = w.id
+                    ))) AS sources
             FROM words w
             WHERE w.language = ? AND has_meaning
             """,

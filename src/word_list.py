@@ -1,5 +1,6 @@
-"""単語一覧 (単語帳の表)。単語ごとの正答率を表にし、列見出しのクリックで並べ替える。
-正答率は意味・性・複数形・転写を別々に集計し (database.history_pool)、それぞれ列にする。"""
+"""単語一覧 (単語帳の表)。単語ごとの誤答スコアと回答数を表にし、列見出しのクリックで並べ替える。
+意味・性・複数形・転写などを別々に集計し (database.history_pool)、それぞれ列にする。
+誤答スコアは「誤答スコア」モードの出題の重みと同じもの (database.incorrect_score) で、最初はこれの高い順に並べて色分けする。"""
 from __future__ import annotations
 
 import tkinter as tk
@@ -14,9 +15,11 @@ from languages import get_language
 
 ALL_TYPES_LABEL = "すべて"
 POOL_LABELS = {MEANING_POOL: "意味", "gender": "性", "plural": "複数形", "valency": "格支配", "conjugation": "活用", "romanization": "転写"}
-# 正答率がこれ未満の行を色分けする
+# 誤答スコアがこれ以上の行を色分けする
+HIGH_SCORE = 0.5
+MIDDLE_SCORE = 0.2
+# 活用の正答率の表で、正答率がこれ未満の行を赤にする
 LOW_ACCURACY = 50.0
-MIDDLE_ACCURACY = 80.0
 
 
 class Column(NamedTuple):
@@ -24,11 +27,13 @@ class Column(NamedTuple):
     heading: str
     width: int
     numeric: bool
-    # 並べ替えのキー。None (未回答の正答率など) は昇順・降順どちらでも末尾に置く
+    # 並べ替えのキー。None (未回答の誤答スコアなど) は昇順・降順どちらでも末尾に置く
     key: Callable[[WordStats], object]
     text: Callable[[WordStats], object]
-    # 正答率の列が属する集計単位。行の色分けに使う
+    # 誤答スコア・回答数の列が属する集計単位。行の色分けに使う
     pool: str | None = None
+    # 初めてクリックしたときに降順で並べるか (誤答スコアは高い順から見たい)
+    descending_first: bool = False
 
 
 def local_time(timestamp: str | None) -> str:
@@ -41,16 +46,16 @@ def local_time(timestamp: str | None) -> str:
 def pool_columns(pool: str) -> list[Column]:
     label = POOL_LABELS[pool]
 
-    def accuracy_text(stats: WordStats) -> str:
-        accuracy = stats.pool(pool).accuracy
-        return "" if accuracy is None else f"{accuracy:.0f}%"
+    def score_text(stats: WordStats) -> str:
+        score = stats.pool(pool).incorrect
+        return "" if score is None else f"{score:.2f}"
 
     def count_text(stats: WordStats) -> str:
         pool_stats = stats.pool(pool)
         return f"{pool_stats.correct}/{pool_stats.answered}" if pool_stats.answered else ""
 
     return [
-        Column(f"{pool}_accuracy", f"{label} 正答率", 85, True, lambda stats: stats.pool(pool).accuracy, accuracy_text, pool),
+        Column(f"{pool}_score", f"{label} 誤答スコア", 95, True, lambda stats: stats.pool(pool).incorrect, score_text, pool, True),
         # 「正解/回答」の列は回答数で並べる
         Column(f"{pool}_answered", f"{label} 正解/回答", 85, True, lambda stats: stats.pool(pool).answered or None, count_text, pool),
     ]
@@ -84,9 +89,9 @@ class WordList(tk.Toplevel):
         self.pools: list[str] = []
         self.columns: list[Column] = []
         self.rows: list[WordStats] = []
-        # 最初は意味の正答率の低い順 (苦手な単語が上)
-        self.sort_column = f"{MEANING_POOL}_accuracy"
-        self.sort_descending = False
+        # 最初は意味の誤答スコアの高い順 (苦手な単語が上)
+        self.sort_column = f"{MEANING_POOL}_score"
+        self.sort_descending = True
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
@@ -149,7 +154,7 @@ class WordList(tk.Toplevel):
             self.tree.heading(column.id, command=lambda column_id=column.id: self.sort_by(column_id))
             self.tree.column(column.id, width=column.width, anchor="e" if column.numeric else "w", stretch=column.id in ("meanings", "sources"))
         if self.sort_column not in {column.id for column in self.columns}:
-            self.sort_column, self.sort_descending = f"{MEANING_POOL}_accuracy", False
+            self.sort_column, self.sort_descending = f"{MEANING_POOL}_score", True
 
         self.type_values = {ALL_TYPES_LABEL: None}
         for label, value in self.question_types:
@@ -182,7 +187,7 @@ class WordList(tk.Toplevel):
         tree.grid(row=0, column=0, padx=10, pady=10)
         ttk.Label(
             window, foreground="gray",
-            text="活用クイズは 動詞の誤り率 × 人称の誤り率 × 時制の誤り率 に比例して出題します (セットの開始時に更新)",
+            text="活用クイズは 動詞の誤り率 × 人称の誤り率 × 時制の誤り率 に比例して出題します (セットの開始時と50問ごとに更新)",
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
 
     def refresh(self) -> None:
@@ -194,7 +199,8 @@ class WordList(tk.Toplevel):
         if column_id == self.sort_column:
             self.sort_descending = not self.sort_descending
         else:
-            self.sort_column, self.sort_descending = column_id, False
+            self.sort_column = column_id
+            self.sort_descending = self._sort_column().descending_first
         self._fill()
 
     def _sort_column(self) -> Column:
@@ -208,7 +214,7 @@ class WordList(tk.Toplevel):
             and (not query or query in stats.word.casefold() or query in stats.meanings.casefold())
         ]
         column = self._sort_column()
-        # 値のない行 (未回答の正答率など) は並び順に関係なく末尾。同じ値の中は、並べ替えている集計単位
+        # 値のない行 (未回答の誤答スコアなど) は並び順に関係なく末尾。同じ値の中は、並べ替えている集計単位
         # (なければ意味) の回答数の多い順 (0/5 を 0/1 より上に)、さらに単語順。sort は安定なので逆順でも保たれる
         tie_pool = column.pool or MEANING_POOL
         rows.sort(key=lambda stats: stats.word.casefold())
@@ -221,11 +227,11 @@ class WordList(tk.Toplevel):
     def _fill(self) -> None:
         self.tree.delete(*self.tree.get_children())
         rows = self._visible_rows()
-        # 色分けは並べ替えている集計単位の正答率で行う (性で並べ替えたら性の正答率)
+        # 色分けは並べ替えている集計単位の誤答スコアで行う (性で並べ替えたら性の誤答スコア)。未回答は灰色
         color_pool = self._sort_column().pool or MEANING_POOL
         for stats in rows:
-            accuracy = stats.pool(color_pool).accuracy
-            tag = "unanswered" if accuracy is None else "low" if accuracy < LOW_ACCURACY else "middle" if accuracy < MIDDLE_ACCURACY else ""
+            score = stats.pool(color_pool).incorrect
+            tag = "unanswered" if score is None else "low" if score >= HIGH_SCORE else "middle" if score >= MIDDLE_SCORE else ""
             self.tree.insert("", "end", values=[column.text(stats) for column in self.columns], tags=(tag,) if tag else ())
         for column in self.columns:
             arrow = (" ▼" if self.sort_descending else " ▲") if column.id == self.sort_column else ""
@@ -233,10 +239,9 @@ class WordList(tk.Toplevel):
         summaries = []
         for pool in self.pools:
             answered = sum(stats.pool(pool).answered for stats in self.rows)
-            correct = sum(stats.pool(pool).correct for stats in self.rows)
             if answered:
-                summaries.append(f"{POOL_LABELS[pool]} {correct / answered * 100:.1f}% ({correct}/{answered})")
+                summaries.append(f"{POOL_LABELS[pool]} {answered}")
         self.status_var.set(
-            f"表示 {len(rows)}語 / 全{len(self.rows)}語  正答率: {'、'.join(summaries) or 'まだ回答がありません'}"
-            f" — 列見出しをクリックで並べ替え。{POOL_LABELS[color_pool]}の正答率 {LOW_ACCURACY:.0f}% 未満は赤、{MIDDLE_ACCURACY:.0f}% 未満は橙"
+            f"表示 {len(rows)}語 / 全{len(self.rows)}語  回答数: {'、'.join(summaries) or 'まだ回答がありません'}"
+            f" — 列見出しをクリックで並べ替え。{POOL_LABELS[color_pool]}の誤答スコア (直近の誤答ほど重い) {HIGH_SCORE} 以上は赤、{MIDDLE_SCORE} 以上は橙"
         )
