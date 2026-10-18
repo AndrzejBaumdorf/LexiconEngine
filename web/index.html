@@ -18,6 +18,7 @@
   <header class="topbar">
     <h1>LexiconEngine</h1>
     <div class="sync">
+      <span id="edit-status" class="badge" hidden></span>
       <span id="sync-status" class="muted"></span>
       <button id="sync-button" class="secondary" disabled>Macと同期</button>
     </div>
@@ -61,6 +62,7 @@
         <label><input id="hint" type="checkbox"> 日本語ヒントを表示する</label>
       </div>
       <div class="actions">
+        <button id="editor-button" class="secondary">単語編集</button>
         <button id="word-list-button" class="secondary">単語一覧</button>
         <button id="start-button">開始</button>
       </div>
@@ -96,9 +98,51 @@
       <p id="list-status" class="muted small"></p>
       <div class="table-wrap"><table id="list-table"><thead></thead><tbody></tbody></table></div>
     </section>
+    <section id="editor" class="screen" hidden>
+      <div class="list-toolbar">
+        <button id="editor-back" class="ghost">← 戻る</button>
+        <select id="editor-file" aria-label="保存先のファイル"></select>
+        <button id="editor-new-file" class="secondary">新しいファイル</button>
+      </div>
+      <div class="editor-layout">
+        <div class="editor-list">
+          <input id="editor-search" type="search" placeholder="単語を検索">
+          <ul id="editor-entries"></ul>
+          <button id="editor-new" class="secondary">＋ 新しい単語</button>
+        </div>
+        <form id="editor-form" class="editor-form" autocomplete="off">
+          <p id="editor-message" class="muted small"></p>
+          <div class="grid2">
+            <label>単語<input id="ed-word" type="text" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+            <label>言語<select id="ed-language"></select></label>
+            <label>レベル<input id="ed-difficulty" type="text"></label>
+            <label>出典<input id="ed-source" type="text" list="ed-sources"></label>
+          </div>
+          <datalist id="ed-sources"></datalist>
+          <datalist id="ed-parts"></datalist>
+          <label class="wide">派生語<input id="ed-derivatives" type="text" autocapitalize="off" spellcheck="false" placeholder="placatory(形容詞)=なだめるような, placation(名詞)"></label>
+          <div id="ed-meanings"></div>
+          <button id="ed-add-meaning" type="button" class="secondary">＋ 意味を追加</button>
+          <p class="muted small">類義語・対義語はカンマ区切り (英→日で使うには forsake=見捨てる)。例文は1行1文で、和訳は同じ行に。活用形が自動で見つからない語は [overrode] のように囲む。</p>
+          <div class="actions">
+            <button id="ed-delete" type="button" class="danger">この単語を削除</button>
+            <button id="ed-save" type="submit">保存</button>
+          </div>
+        </form>
+      </div>
+    </section>
   </main>
 
+  <dialog id="dialog">
+    <form method="dialog">
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-body" class="dialog-body"></div>
+      <div id="dialog-buttons" class="actions"></div>
+    </form>
+  </dialog>
+
   <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+  <script src="editor.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from database import LexiconDatabase, QuizScope
 from languages import get_language
+from materials import MATERIALS_DIR, SAMPLE_JSON_PATH as DEFAULT_SAMPLE_JSON_PATH, file_label
 from quiz_types import (
     MAX_QUESTION_COUNT, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types, question_label,
 )
@@ -18,17 +19,7 @@ from sync_dialog import SyncDialog, TransferRow
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon.db"
-DEFAULT_SAMPLE_JSON_PATH = Path(__file__).resolve().parent.parent / "samples" / "sample_words.json"
-MATERIALS_DIR = Path(__file__).resolve().parent.parent / "materials"
 SCOPE_LIST_HEIGHT = 4
-def file_label(path: Path) -> str:
-    """出題範囲の「ファイル」に出す名前。教材フォルダの中なら相対パス (basic/basic_time.json)、外ならファイル名"""
-    try:
-        return path.resolve().relative_to(MATERIALS_DIR).as_posix()
-    except ValueError:
-        return path.name
-
-
 class QuizApp(tk.Tk):
     def __init__(self, db_path: Path) -> None:
         super().__init__()

@@ -568,11 +568,12 @@ class LexiconDatabase:
 
     def sync_with_json(
         self, json_files: list[tuple[Path, str]], apply: bool, transfers: dict[tuple[str, str], str] | None = None,
+        extra_transfers: dict[tuple[str, str], str] | None = None,
     ) -> SyncReport:
         """DBの単語データを、JSONファイル (パス, ファイル名) をすべて新しいDBに取り込んだものと照合する。
         apply=True なら単語データをそれに置き換え、回答履歴は同じ単語 (見出し語×言語) に付け替える。
         消える単語の回答履歴は transfers {(言語, 消える単語): 引き継ぐ単語} の単語に引き継ぎ、それ以外は消える。
-        transfers を省略すると、綴りを直したとみなした単語 (renamed_words) だけ引き継ぐ。
+        transfers を省略すると、綴りを直したとみなした単語 (renamed_words) と extra_transfers (消える単語のものだけ) を引き継ぐ。
         取り込みの順番は json_files の順 (語形などは後のファイルが優先)"""
         with tempfile.TemporaryDirectory() as directory:
             fresh = LexiconDatabase(Path(directory) / "fresh.db")
@@ -591,6 +592,8 @@ class LexiconDatabase:
                 if apply and report.changed:
                     if transfers is None:
                         transfers = {(language, old): new for language, old, new, _ in report.renamed_words}
+                        removed = {(language, word) for language, word, _ in report.removed_words}
+                        transfers.update({key: new for key, new in (extra_transfers or {}).items() if key in removed})
                     self._replace_content(transfers)
             except Exception:
                 self.connection.rollback()
@@ -769,6 +772,38 @@ class LexiconDatabase:
             self._replace_content({})
         finally:
             self.connection.execute("DETACH DATABASE fresh")
+
+    def remove_entry(self, word: str, language: str, source: str, difficulty: str) -> None:
+        """見出し1つを消し、どの見出しにも属さなくなった意味・例文を消す (単語と回答履歴は残す)"""
+        row = self.connection.execute(
+            "SELECT e.id, e.word_id FROM entries e JOIN words w ON w.id = e.word_id JOIN sources s ON s.id = e.source_id"
+            " WHERE w.word=? AND w.language=? AND s.name=? AND e.difficulty=?",
+            (split_separable(word)[0], language, source or "JSON", difficulty or ""),
+        ).fetchone()
+        if row is None:
+            return
+        word_ids = {row["word_id"]} | {
+            item[0] for item in self.connection.execute(
+                "SELECT DISTINCT p.word_id FROM entry_meanings em JOIN meanings m ON m.id = em.meaning_id"
+                " JOIN parts_of_speech p ON p.id = m.part_of_speech_id WHERE em.entry_id=?",
+                (row["id"],),
+            )
+        }
+        self.connection.execute("DELETE FROM entries WHERE id=?", (row["id"],))
+        for word_id in word_ids:
+            self.connection.execute(
+                """
+                DELETE FROM meanings WHERE part_of_speech_id IN (SELECT id FROM parts_of_speech WHERE word_id=?)
+                  AND id NOT IN (SELECT meaning_id FROM entry_meanings) AND id NOT IN (SELECT related_meaning_id FROM meaning_relations)
+                """,
+                (word_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM parts_of_speech WHERE word_id=? AND NOT EXISTS (SELECT 1 FROM meanings WHERE part_of_speech_id = parts_of_speech.id)",
+                (word_id,),
+            )
+            self.connection.execute("DELETE FROM examples WHERE word_id=? AND id NOT IN (SELECT example_id FROM entry_examples)", (word_id,))
+        self.connection.commit()
 
     def import_json(self, json_path: Path, file_label: str | None = None) -> int:
         """JSONを取り込む。file_label は出題範囲の「ファイル」に出す名前 (省略時はファイル名)"""

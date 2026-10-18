@@ -3,7 +3,10 @@
 "use strict";
 
 const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
-const PY_MODULES = ["cloze", "database", "english", "german", "korean", "languages", "quiz_types", "web_bridge"];
+const PY_MODULES = [
+  "cloze", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
+  "web_bridge", "web_editor",
+];
 const APP_DIR = "/home/pyodide/app";
 const DB_PATH = "/home/pyodide/data/lexicon.db";
 const CONTENT_PATH = "/home/pyodide/data/content.db";
@@ -12,6 +15,7 @@ const MIDDLE_SCORE = 0.2;
 
 let pyodide = null;
 let bridge = null;
+let editorBridge = null;
 const state = { options: null, question: null, answered: false, list: null, sort: { key: null, descending: true } };
 
 const $ = (id) => document.getElementById(id);
@@ -47,6 +51,36 @@ async function idbPut(key, value) {
   });
 }
 
+async function idbDelete(key) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction("files", "readwrite");
+    transaction.objectStore("files").delete(key);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+// prefix で始まるキーの [キー, 値] をすべて返す
+async function idbEntries(prefix) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const results = [];
+    const range = IDBKeyRange.bound(prefix, `${prefix}\uffff`);
+    const request = db.transaction("files").objectStore("files").openCursor(range);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve(results);
+        return;
+      }
+      results.push([cursor.key, cursor.value]);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
 async function saveDatabase() {
   await idbPut("lexicon.db", pyodide.FS.readFile(DB_PATH));
 }
@@ -75,12 +109,16 @@ async function boot() {
   for (const [name, source] of sources) pyodide.FS.writeFile(`${APP_DIR}/${name}.py`, source);
   pyodide.runPython(`import sys\nsys.path.insert(0, "${APP_DIR}")`);
   bridge = pyodide.pyimport("web_bridge");
+  editorBridge = pyodide.pyimport("web_editor");
+  editorBridge.configure(MATERIALS_ROOT, EDITS_FILE);
+  await restoreEditorFiles();
 
   const saved = await idbGet("lexicon.db");
   if (saved) pyodide.FS.writeFile(DB_PATH, saved);
   const opened = call("open_database", DB_PATH);
   $("sync-button").disabled = false;
   showSyncStatus();
+  updateEditStatus();
   if (!opened.words) {
     show("first-sync");
     return;
@@ -389,17 +427,24 @@ async function sync() {
     }, 30000);
     if (!response.ok) throw new Error(`Mac の応答: ${response.status}`);
     const remote = await response.json();
-    // 2. 単語データを Mac のもので置き換えてから、受け取った回答履歴を足す
+    // 2. この端末の単語編集を Mac の教材JSONに反映する (Mac の DB も作り直される)
+    const edited = await syncEdits();
+    // 3. 単語データを Mac のもので置き換えてから、受け取った回答履歴を足す
     const content = await fetchWithTimeout("api/content", {}, 30000);
     if (!content.ok) throw new Error(`Mac の応答: ${content.status}`);
     pyodide.FS.writeFile(CONTENT_PATH, new Uint8Array(await content.arrayBuffer()));
     const result = JSON.parse(bridge.apply_sync(CONTENT_PATH, JSON.stringify(remote.rows)));
     pyodide.FS.unlink(CONTENT_PATH);
+    // 4. 教材JSONの写しを Mac のものにする (まだ反映していない編集は重ねて残す)
+    await pullMaterials();
     await saveDatabase();
     const now = new Date().toISOString().replace("T", " ").slice(0, 19);
     await idbPut("last-sync", now);
     await showSyncStatus();
-    alert(`同期しました。\nMac に送った回答: ${remote.added}件\nMac から受け取った回答: ${result.added}件`);
+    const lines = [`同期しました。`, `Mac に送った回答: ${remote.added}件`, `Mac から受け取った回答: ${result.added}件`];
+    if (edited.sent) lines.push(`Mac に反映した編集: ${edited.sent}件`);
+    if (edited.conflicts) lines.push(`あとで決める競合: ${edited.conflicts}件 (次の同期でまた確認します)`);
+    alert(lines.join("\n"));
     if (!state.question) await showSetup($("language").value);
   } catch (error) {
     console.error(error);
@@ -422,7 +467,28 @@ function pythonMessage(error) {
   return lines[lines.length - 1];
 }
 
+// --- 確認画面 (競合の選択など) ---
+
+function showDialog(title, body, buttons) {
+  const dialog = $("dialog");
+  $("dialog-title").textContent = title;
+  $("dialog-body").replaceChildren(body);
+  $("dialog-buttons").replaceChildren(...buttons.map((button) => {
+    const element = document.createElement("button");
+    element.value = button.value;
+    element.textContent = button.label;
+    if (button.className) element.className = button.className;
+    return element;
+  }));
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue || buttons[0].value), { once: true });
+    dialog.showModal();
+  });
+}
+
 // --- イベント ---
+
+initEditorEvents();
 
 $("language").addEventListener("change", () => showSetup($("language").value));
 $("question-type").addEventListener("change", updateHintRow);

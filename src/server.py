@@ -19,6 +19,8 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
 from database import LexiconDatabase
+from edits import apply_edits
+from materials import MATERIALS_DIR, file_label, load_entries, material_paths, sync_paths
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "src"
@@ -29,10 +31,14 @@ CERT_FILE = CERT_DIR / "cert.pem"
 KEY_FILE = CERT_DIR / "key.pem"
 DEFAULT_PORT = 8443
 # ブラウザ版の Pyodide に読み込ませる Python ファイル (tkinter を使うものは含めない)
-BROWSER_MODULES = ("cloze", "database", "english", "german", "korean", "languages", "quiz_types", "web_bridge")
+BROWSER_MODULES = (
+    "cloze", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
+    "web_bridge", "web_editor",
+)
 
 app = Flask(__name__)
 app.config["DB_PATH"] = DEFAULT_DB_PATH
+app.config["MATERIALS_DIR"] = MATERIALS_DIR
 
 
 def open_db() -> LexiconDatabase:
@@ -98,6 +104,33 @@ def content():
     return send_file(io.BytesIO(data), mimetype="application/x-sqlite3", max_age=0)
 
 
+@app.get("/api/materials")
+def materials():
+    """教材JSONの写し。ブラウザ版の単語エディタが編集に使う"""
+    directory = app.config["MATERIALS_DIR"]
+    return jsonify({"files": {file_label(path, directory): load_entries(path) for path in material_paths(directory)}})
+
+
+@app.post("/api/edits")
+def receive_edits():
+    """ブラウザ版の単語編集を教材JSONに反映し、DB をJSONに合わせる。競合した編集は反映せずに返す"""
+    edits = request.get_json(force=True).get("edits", [])
+    result = apply_edits(edits, app.config["MATERIALS_DIR"])
+    removed_history = 0
+    if result["changed"]:
+        database = open_db()
+        try:
+            # 編集した単語の綴りが変わったときは回答履歴を引き継ぐ
+            renames = {(language, old): new for language, old, new in result["renames"]}
+            report = database.sync_with_json(sync_paths(app.config["MATERIALS_DIR"]), apply=True, extra_transfers=renames)
+            removed_history = sum(
+                count for language, word, count in report.removed_words if (language, word) not in renames
+            )
+        finally:
+            database.close()
+    return jsonify({**result, "removed_history": removed_history})
+
+
 @app.get("/<path:filename>")
 def static_file(filename: str):
     return send_from_directory(WEB_DIR, filename)
@@ -145,12 +178,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LexiconEngine のブラウザ版の配信と同期")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="同期するDB")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--materials", type=Path, default=MATERIALS_DIR, help="教材フォルダ")
     parser.add_argument("--setup-cert", action="store_true", help="HTTPS の証明書を作る (最初に1回)")
     args = parser.parse_args()
     if args.setup_cert:
         setup_cert()
         return
     app.config["DB_PATH"] = args.db
+    app.config["MATERIALS_DIR"] = args.materials
     open_db().close()
     secure = CERT_FILE.exists() and KEY_FILE.exists()
     scheme = "https" if secure else "http"

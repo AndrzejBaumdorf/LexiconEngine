@@ -4,14 +4,17 @@
 // - 同期の API (/api/): キャッシュしない
 "use strict";
 
-const CACHE = "lexicon-engine-v1";
+const CACHE = "lexicon-engine-v2";
 const NETWORK_TIMEOUT = 3000;
 // Mac につながらなかったら、しばらくは待たずにキャッシュを使う (起動時に何度も待たないように)
 const OFFLINE_GRACE = 30000;
 let offlineUntil = 0;
 const APP_FILES = [
-  "./", "index.html", "app.js", "style.css", "manifest.webmanifest", "icon-180.png", "icon-512.png",
-  ...["cloze", "database", "english", "german", "korean", "languages", "quiz_types", "web_bridge"].map((name) => `py/${name}.py`),
+  "./", "index.html", "app.js", "editor.js", "style.css", "manifest.webmanifest", "icon-180.png", "icon-512.png",
+  ...[
+    "cloze", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
+    "web_bridge", "web_editor",
+  ].map((name) => `py/${name}.py`),
 ];
 
 self.addEventListener("install", (event) => {
