@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 import re
 import sqlite3
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from typing import NamedTuple
 from difflib import SequenceMatcher
@@ -110,7 +111,7 @@ class QuizScope:
     sources: tuple[str, ...] = ()
     difficulties: tuple[str, ...] = ()
     parts_of_speech: tuple[str, ...] = ()
-    # 取り込んだJSONファイル (教材フォルダからの相対パス)
+    # 取り込んだJSONファイル (教材フォルダからの相対パス)。"/" で終わるものはフォルダで、その下のファイルすべて
     files: tuple[str, ...] = ()
 
     def condition(self, word: str = "w", meaning: str = "m", part: str = "p") -> tuple[str, tuple]:
@@ -128,15 +129,28 @@ class QuizScope:
                 entry_clauses.append(f"e.difficulty IN ({', '.join('?' for _ in self.difficulties)})")
                 params += self.difficulties
             if self.files:
+                files = [file for file in self.files if not file.endswith("/")]
+                folders = [file for file in self.files if file.endswith("/")]
+                file_clauses = [f"ef.file IN ({', '.join('?' for _ in files)})"] if files else []
+                file_clauses += ["substr(ef.file, 1, ?) = ?"] * len(folders)
                 entry_clauses.append(
-                    f"EXISTS (SELECT 1 FROM entry_files ef WHERE ef.entry_id = e.id AND ef.file IN ({', '.join('?' for _ in self.files)}))"
+                    f"EXISTS (SELECT 1 FROM entry_files ef WHERE ef.entry_id = e.id AND ({' OR '.join(file_clauses)}))"
                 )
-                params += self.files
+                params += files
+                for folder in folders:
+                    params += (len(folder), folder)
             clauses.append(
                 "EXISTS (SELECT 1 FROM entry_meanings em JOIN entries e ON e.id = em.entry_id"
                 f" JOIN sources s ON s.id = e.source_id WHERE {' AND '.join(entry_clauses)})"
             )
         return " AND ".join(clauses), tuple(params)
+
+
+def with_folders(files: list[str]) -> list[str]:
+    """出題範囲の「ファイル」の選択肢。ファイルに加えて、その上のフォルダ ("English/JapanTimes_EX/") も選べるようにする。
+    一番上 (言語名) のフォルダは、言語で選ぶのと同じなので出さない。パスの順に並べるので、フォルダはその中のファイルの前に来る"""
+    folders = {file.rsplit("/", depth)[0] + "/" for file in files for depth in range(1, file.count("/"))}
+    return sorted({*files, *folders})
 
 
 class SyncReport(NamedTuple):
@@ -394,6 +408,8 @@ class LexiconDatabase:
             CREATE INDEX IF NOT EXISTS meaning_relations_related ON meaning_relations(related_meaning_id);
             CREATE INDEX IF NOT EXISTS answer_history_type_word ON answer_history(question_type, word_id, id);
             CREATE INDEX IF NOT EXISTS answer_history_word ON answer_history(word_id);
+            UPDATE answer_history SET uid = lower(hex(randomblob(16))) WHERE uid IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS answer_history_uid ON answer_history(uid);
             """
         )
         self.connection.commit()
@@ -461,6 +477,8 @@ class LexiconDatabase:
             ("answer_history", "variant", "TEXT"),
             # 格支配クイズ用の例文の穴 ({"slot": "von+Dat", "phrase": "vom Bahnhof", "hint": "der Bahnhof"} の JSON)
             ("examples", "valency", "TEXT"),
+            # 回答の一意なID。端末 (Mac と iPad) の間で回答履歴を同期するときに、同じ回答を二重に入れないために使う
+            ("answer_history", "uid", "TEXT"),
         ):
             columns = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if column not in columns:
@@ -687,6 +705,70 @@ class LexiconDatabase:
             self.connection.commit()
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
+
+    # --- 端末間の同期 (Mac の server.py と iPad のブラウザ版) ---
+
+    def history_rows(self, exclude_uids: set[str] = frozenset()) -> list[dict]:
+        """回答履歴を端末に依存しない形 (単語は見出し語×言語) で返す。exclude_uids の回答は除く"""
+        rows = self.connection.execute(
+            """
+            SELECT h.uid, w.word, w.language, h.question_type, h.selected_answer, h.correct_answer, h.is_correct, h.answered_at, h.variant
+            FROM answer_history h JOIN words w ON w.id = h.word_id ORDER BY h.answered_at, h.id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows if row["uid"] not in exclude_uids]
+
+    def history_uids(self) -> set[str]:
+        return {row[0] for row in self.connection.execute("SELECT uid FROM answer_history")}
+
+    def merge_history(self, rows: list[dict]) -> tuple[int, int]:
+        """ほかの端末の回答履歴を足す。すでにある回答 (uid が同じ) は入れない。
+        (足した件数, この端末にない単語なので入れなかった件数) を返す"""
+        word_ids = {(row["word"], row["language"]): row["id"] for row in self.connection.execute("SELECT id, word, language FROM words")}
+        known = self.history_uids()
+        added = skipped = 0
+        for row in rows:
+            if row["uid"] in known:
+                continue
+            word_id = word_ids.get((row["word"], row["language"]))
+            if word_id is None:
+                skipped += 1
+                continue
+            self.connection.execute(
+                "INSERT INTO answer_history(word_id, question_type, selected_answer, correct_answer, is_correct, answered_at, variant, uid)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    word_id, row["question_type"], row["selected_answer"], row["correct_answer"], int(row["is_correct"]),
+                    row["answered_at"], row["variant"], row["uid"],
+                ),
+            )
+            known.add(row["uid"])
+            added += 1
+        self.connection.commit()
+        return added, skipped
+
+    def export_content(self, path: Path) -> None:
+        """単語データだけ (回答履歴なし) のDBを path に書き出す。ほかの端末が replace_content_from で取り込む"""
+        path.unlink(missing_ok=True)
+        self.connection.commit()
+        self.connection.execute("VACUUM INTO ?", (str(path),))
+        exported = sqlite3.connect(path)
+        try:
+            exported.execute("DELETE FROM answer_history")
+            exported.commit()
+            exported.execute("VACUUM")
+        finally:
+            exported.close()
+
+    def replace_content_from(self, path: Path) -> None:
+        """単語データを export_content で書き出したDBのものに置き換える。回答履歴は同じ単語に付け替え、
+        相手にない単語の回答履歴は消える (先に merge_history で相手に送っておく)"""
+        self.connection.commit()
+        self.connection.execute("ATTACH DATABASE ? AS fresh", (str(path),))
+        try:
+            self._replace_content({})
+        finally:
+            self.connection.execute("DETACH DATABASE fresh")
 
     def import_json(self, json_path: Path, file_label: str | None = None) -> int:
         """JSONを取り込む。file_label は出題範囲の「ファイル」に出す名前 (省略時はファイル名)"""
@@ -1208,12 +1290,12 @@ class LexiconDatabase:
             """,
             (language,),
         ).fetchall()
-        files = self.connection.execute(
+        files = [row[0] for row in self.connection.execute(
             "SELECT DISTINCT f.file FROM entry_files f JOIN entries e ON e.id = f.entry_id JOIN words w ON w.id = e.word_id"
             " WHERE w.language=? ORDER BY f.file",
             (language,),
-        ).fetchall()
-        return [row[0] for row in sources], [row[0] for row in difficulties], [row[0] for row in parts_of_speech], [row[0] for row in files]
+        )]
+        return [row[0] for row in sources], [row[0] for row in difficulties], [row[0] for row in parts_of_speech], with_folders(files)
 
     def create_question(self, question_type: str, show_hint: bool = False, scope: QuizScope | None = None) -> Question:
         scope = scope or QuizScope()
@@ -1480,10 +1562,11 @@ class LexiconDatabase:
     def record_answer(self, question: Question, selected_answer: str) -> bool:
         correct = question.is_correct(selected_answer)
         self.connection.execute(
-            "INSERT INTO answer_history(word_id, question_type, selected_answer, correct_answer, is_correct, variant) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO answer_history(word_id, question_type, selected_answer, correct_answer, is_correct, variant, uid)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 question.word_id, question.question_type, selected_answer, question.answer, int(correct),
-                json.dumps(question.variant, ensure_ascii=False) if question.variant else None,
+                json.dumps(question.variant, ensure_ascii=False) if question.variant else None, uuid.uuid4().hex,
             ),
         )
         self.connection.commit()

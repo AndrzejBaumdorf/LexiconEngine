@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>LexiconEngine</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Lexicon">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1b1c1f" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="icon" href="icon-180.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>LexiconEngine</h1>
+    <div class="sync">
+      <span id="sync-status" class="muted"></span>
+      <button id="sync-button" class="secondary" disabled>Macと同期</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="loading" class="screen">
+      <p id="loading-message">読み込み中…</p>
+    </section>
+
+    <section id="first-sync" class="screen" hidden>
+      <h2>はじめに Mac と同期してください</h2>
+      <p class="muted">この端末にはまだ単語データがありません。Mac で <code>python src/server.py</code> を起動し、同じ Wi-Fi で「Macと同期」を押してください。</p>
+    </section>
+
+    <section id="setup" class="screen" hidden>
+      <div class="row">
+        <label for="language">言語</label>
+        <select id="language"></select>
+      </div>
+      <div class="scope">
+        <div class="scope-group" data-key="sources"><h3>出典</h3><div class="chips"></div></div>
+        <div class="scope-group" data-key="difficulties"><h3>レベル</h3><div class="chips"></div></div>
+        <div class="scope-group" data-key="parts_of_speech"><h3>品詞</h3><div class="chips"></div></div>
+        <div class="scope-group" data-key="files"><h3>ファイル</h3><div class="chips"></div></div>
+        <p class="muted small">未選択ならすべて</p>
+      </div>
+      <div class="row">
+        <label for="question-type">問題形式</label>
+        <select id="question-type"></select>
+      </div>
+      <div class="row">
+        <label for="count">出題数</label>
+        <input id="count" type="number" inputmode="numeric" min="1" value="10">
+      </div>
+      <div class="row">
+        <label for="score-mode">出題モード</label>
+        <select id="score-mode"></select>
+      </div>
+      <div class="row" id="hint-row" hidden>
+        <label><input id="hint" type="checkbox"> 日本語ヒントを表示する</label>
+      </div>
+      <div class="actions">
+        <button id="word-list-button" class="secondary">単語一覧</button>
+        <button id="start-button">開始</button>
+      </div>
+      <p id="summary" class="summary"></p>
+    </section>
+
+    <section id="quiz" class="screen" hidden>
+      <div class="quiz-head">
+        <span id="progress" class="muted"></span>
+        <button id="stop-button" class="ghost">中断</button>
+      </div>
+      <p id="prompt" class="prompt"></p>
+      <div id="choices" class="choices"></div>
+      <div id="typed" class="typed" hidden>
+        <input id="typed-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <div id="special-characters" class="special-characters"></div>
+      </div>
+      <p id="feedback" class="feedback"></p>
+      <div class="actions">
+        <button id="skip-button" class="secondary">スキップ</button>
+        <button id="answer-button">回答する</button>
+      </div>
+    </section>
+
+    <section id="word-list" class="screen" hidden>
+      <div class="list-toolbar">
+        <button id="list-back" class="ghost">← 戻る</button>
+        <select id="list-language"></select>
+        <select id="list-type"></select>
+        <input id="list-search" type="search" placeholder="検索">
+        <label class="small"><input id="list-answered" type="checkbox"> 回答済みのみ</label>
+      </div>
+      <p id="list-status" class="muted small"></p>
+      <div class="table-wrap"><table id="list-table"><thead></thead><tbody></tbody></table></div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

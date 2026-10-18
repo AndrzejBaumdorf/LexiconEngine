@@ -11,10 +11,10 @@ from typing import NamedTuple
 
 from database import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, WordStats
 from languages import get_language
+from quiz_types import POOL_LABELS
 
 
 ALL_TYPES_LABEL = "すべて"
-POOL_LABELS = {MEANING_POOL: "意味", "gender": "性", "plural": "複数形", "valency": "格支配", "conjugation": "活用", "romanization": "転写"}
 # 誤答スコアがこれ以上の行を色分けする
 HIGH_SCORE = 0.5
 MIDDLE_SCORE = 0.2

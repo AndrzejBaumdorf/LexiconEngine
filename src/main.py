@@ -9,6 +9,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from database import LexiconDatabase, QuizScope
 from languages import get_language
+from quiz_types import (
+    MAX_QUESTION_COUNT, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types, question_label,
+)
 from word_editor import WordEditor
 from word_list import WordList
 from sync_dialog import SyncDialog, TransferRow
@@ -17,46 +20,13 @@ from sync_dialog import SyncDialog, TransferRow
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon.db"
 DEFAULT_SAMPLE_JSON_PATH = Path(__file__).resolve().parent.parent / "samples" / "sample_words.json"
 MATERIALS_DIR = Path(__file__).resolve().parent.parent / "materials"
-# 問題形式のIDは回答履歴に保存されるため変えない。表示名の {lang} は選んだ言語の略称 (英・独など) になる
-SKIPPED_ANSWER = "(スキップ)"
-MAX_QUESTION_COUNT = 1000
-# 出題モードの表示名 → database.SCORE_MODES。先頭が初期値
-SCORE_MODE_LABELS = {
-    "未習得スコア (未回答・回答の少ない単語も優先)": "unlearned",
-    "誤答スコア (最近間違えた単語だけを優先。見直し用)": "incorrect",
-}
 SCOPE_LIST_HEIGHT = 4
-QUESTION_TYPES = [
-    ("{lang}→日", "english_to_japanese"),
-    ("日→{lang}", "japanese_to_english"),
-    ("例文穴埋め", "cloze"),
-    ("類義語・対義語", "relation"),
-    ("派生語", "derivative"),
-    ("ラテン文字転写", "romanization"),
-    ("性 (冠詞)", "gender"),
-    ("複数形", "plural"),
-    ("格支配", "valency"),
-    ("活用", "conjugation"),
-]
-
-
 def file_label(path: Path) -> str:
     """出題範囲の「ファイル」に出す名前。教材フォルダの中なら相対パス (basic/basic_time.json)、外ならファイル名"""
     try:
         return path.resolve().relative_to(MATERIALS_DIR).as_posix()
     except ValueError:
         return path.name
-
-
-def available_question_types(language: str) -> list[str]:
-    # 転写・性・複数形などの問題形式は、対応した言語 (韓国語・ドイツ語など) のときだけ選べる
-    language_spec = get_language(language)
-    return [value for _, value in QUESTION_TYPES if language_spec.supports(value)]
-
-
-def question_label(question_type: str, language: str) -> str:
-    template = next(label for label, value in QUESTION_TYPES if value == question_type)
-    return template.format(lang=get_language(language).label if language else "外")
 
 
 class QuizApp(tk.Tk):
