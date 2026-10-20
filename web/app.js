@@ -433,6 +433,14 @@ async function sync() {
     const content = await fetchWithTimeout("api/content", {}, 30000);
     if (!content.ok) throw new Error(`Mac の応答: ${content.status}`);
     pyodide.FS.writeFile(CONTENT_PATH, new Uint8Array(await content.arrayBuffer()));
+    // Mac の単語データが今より極端に少ないときは、Mac 側の事故 (DB が空になったなど) とみなして置き換えない
+    const check = JSON.parse(bridge.content_check(CONTENT_PATH));
+    if (check.local_words >= 50 && check.content_words < check.local_words * 0.5) {
+      pyodide.FS.unlink(CONTENT_PATH);
+      throw guardError(`Mac の単語データ (${check.content_words}語) がこの端末 (${check.local_words}語) よりかなり少ないため、置き換えを止めました。Mac の DB を確認してください (「バックアップから復元」で戻せます)`);
+    }
+    // 置き換える前のこの端末の DB を1つ残しておく
+    await idbPut("lexicon.db.before-sync", pyodide.FS.readFile(DB_PATH));
     const result = JSON.parse(bridge.apply_sync(CONTENT_PATH, JSON.stringify(remote.rows)));
     pyodide.FS.unlink(CONTENT_PATH);
     // 4. 教材JSONの写しを Mac のものにする (まだ反映していない編集は重ねて残す)
@@ -444,15 +452,24 @@ async function sync() {
     const lines = [`同期しました。`, `Mac に送った回答: ${remote.added}件`, `Mac から受け取った回答: ${result.added}件`];
     if (edited.sent) lines.push(`Mac に反映した編集: ${edited.sent}件`);
     if (edited.conflicts) lines.push(`あとで決める競合: ${edited.conflicts}件 (次の同期でまた確認します)`);
+    for (const warning of edited.warnings) lines.push(`\n⚠ ${warning}`);
     alert(lines.join("\n"));
     if (!state.question) await showSetup($("language").value);
   } catch (error) {
     console.error(error);
     showSyncStatus("同期できませんでした");
-    alert(`Mac と同期できませんでした。Mac で server.py が動いていて、同じ Wi-Fi につながっているか確認してください。\n\n${pythonMessage(error)}`);
+    if (error.guard) alert(`同期を途中で止めました (この端末のデータはそのままです)。\n\n${error.message}`);
+    else alert(`Mac と同期できませんでした。Mac で server.py が動いていて、同じ Wi-Fi につながっているか確認してください。\n\n${pythonMessage(error)}`);
   } finally {
     button.disabled = false;
   }
+}
+
+// 同期の安全装置で止めたことを表すエラー (通信の失敗とは分けて知らせる)
+function guardError(message) {
+  const error = new Error(message);
+  error.guard = true;
+  return error;
 }
 
 function fetchWithTimeout(url, options, timeout) {

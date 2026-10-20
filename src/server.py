@@ -19,7 +19,8 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
 from database import LexiconDatabase
-from edits import apply_edits
+from backups import backup_database, backup_materials
+from edits import apply_edits, key_of, material_path
 from materials import MATERIALS_DIR, file_label, load_entries, material_paths, sync_paths
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -113,22 +114,43 @@ def materials():
 
 @app.post("/api/edits")
 def receive_edits():
-    """ブラウザ版の単語編集を教材JSONに反映し、DB をJSONに合わせる。競合した編集は反映せずに返す"""
+    """ブラウザ版の単語編集を教材JSONに反映し、DB をJSONに合わせる。競合した編集は反映せずに返す。
+    書き換える前に教材JSONと DB をバックアップし、編集では説明できない単語が消えそうなときは DB を作り直さない"""
     edits = request.get_json(force=True).get("edits", [])
-    result = apply_edits(edits, app.config["MATERIALS_DIR"])
+    directory = app.config["MATERIALS_DIR"]
+    backup_materials([material_path(directory, edit["file"]) for edit in edits], directory, "ipad-edits")
+    result = apply_edits(edits, directory)
+    warning = ""
     removed_history = 0
     if result["changed"]:
         database = open_db()
         try:
             # 編集した単語の綴りが変わったときは回答履歴を引き継ぐ
             renames = {(language, old): new for language, old, new in result["renames"]}
-            report = database.sync_with_json(sync_paths(app.config["MATERIALS_DIR"]), apply=True, extra_transfers=renames)
-            removed_history = sum(
-                count for language, word, count in report.removed_words if (language, word) not in renames
-            )
+            applied = set(result["applied"])
+            # 編集で消える見込みの単語 (削除した見出し・綴りを直す前の単語)。これ以外が消えるなら事故の可能性がある
+            expected = {
+                (edit["base_key"][1], edit["base_key"][0]) for edit in edits
+                if edit["id"] in applied and edit.get("base_key") and (edit.get("entry") is None or tuple(edit["base_key"][:2]) != tuple(key_of(edit["entry"])[:2]))
+            }
+            preview = database.sync_with_json(sync_paths(directory), apply=False, extra_transfers=renames)
+            unexpected = [(language, word) for language, word, _ in preview.removed_words if (language, word) not in expected]
+            if unexpected:
+                # DB はそのままにして、編集したファイルだけを取り込む (消すかどうかは Mac の「JSONと照合」で確認してもらう)
+                for file in result["changed"]:
+                    database.import_json(material_path(directory, file), file)
+                words = ", ".join(word for _, word in unexpected[:10]) + (" …" if len(unexpected) > 10 else "")
+                warning = (
+                    f"編集とは関係なく DB から消える単語が {len(unexpected)}語 あったため、Mac の DB の作り直しを止めました ({words})。"
+                    " Mac のアプリで「JSONと照合」を開いて確認してください。"
+                )
+            else:
+                backup_database(database.connection, "ipad-edits")
+                report = database.sync_with_json(sync_paths(directory), apply=True, extra_transfers=renames)
+                removed_history = sum(count for language, word, count in report.removed_words if (language, word) not in renames)
         finally:
             database.close()
-    return jsonify({**result, "removed_history": removed_history})
+    return jsonify({**result, "removed_history": removed_history, "warning": warning})
 
 
 @app.get("/<path:filename>")

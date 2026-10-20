@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from backups import BACKUP_DIR, backup_database
 from database import LexiconDatabase, QuizScope
 from languages import get_language
 from materials import MATERIALS_DIR, SAMPLE_JSON_PATH as DEFAULT_SAMPLE_JSON_PATH, file_label
@@ -65,8 +67,9 @@ class QuizApp(tk.Tk):
         ttk.Button(frame, text="単語編集", command=self.open_editor).grid(row=0, column=5, padx=5)
         ttk.Button(frame, text="単語一覧", command=self.open_word_list).grid(row=0, column=6, padx=5)
         ttk.Button(frame, text="JSONと照合", command=self.sync_with_json).grid(row=0, column=7, padx=5)
+        ttk.Button(frame, text="バックアップから復元", command=self.restore_backup).grid(row=0, column=8, padx=5)
         self.db_status_var = tk.StringVar(value="未接続")
-        ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=8, sticky="w", padx=5, pady=(0, 5))
+        ttk.Label(frame, textvariable=self.db_status_var, foreground="gray").grid(row=1, column=0, columnspan=9, sticky="w", padx=5, pady=(0, 5))
 
     def _build_setup_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="クイズ設定")
@@ -392,7 +395,17 @@ class QuizApp(tk.Tk):
             ("消える例文", [f"{word}: {sentence}" for _, word, sentence in report.removed_examples]),
             ("増える例文", [f"{word}: {sentence}" for _, word, sentence in report.added_examples]),
         ]
-        lines = [f"{len(paths)}ファイルと照合しました。「反映」でDBの単語データをJSONに合わせます (元に戻せません)。"]
+        lines = [f"{len(paths)}ファイルと照合しました。「反映」でDBの単語データをJSONに合わせます (反映の前にDBを自動でバックアップします)。"]
+        # 選ぶフォルダを間違えたときなど、たくさん消えるときは目立つように先に警告する
+        total_words = self.database.connection.execute("SELECT COUNT(*) FROM words").fetchone()[0]
+        history = sum(count for *_, count in report.removed_words)
+        removed = len(report.removed_words)
+        if removed and (removed >= max(10, total_words * 0.1) or history):
+            lines.insert(0, (
+                f"⚠ 注意: 単語 {removed}語 ({removed / max(total_words, 1) * 100:.0f}%) が消えます"
+                + (f"。回答履歴 {history}件も消えます" if history else "")
+                + "。選んだフォルダ (ふつうは materials) が正しいか確認してください。\n"
+            ))
         for title, items in sections:
             if items:
                 lines.append(f"\n{title} {len(items)}件:\n" + "\n".join("・" + item for item in items))
@@ -417,13 +430,43 @@ class QuizApp(tk.Tk):
         if transfers is None:
             return
         try:
+            backup = backup_database(self.database.connection, "sync")
             self.database.sync_with_json(json_files, apply=True, transfers=transfers)
         except (OSError, ValueError) as error:
             messagebox.showerror("反映できません", str(error))
             return
         self._refresh_languages()
         self._refresh_word_list()
-        messagebox.showinfo("反映完了", "DBの単語データをJSONに合わせました。")
+        messagebox.showinfo("反映完了", f"DBの単語データをJSONに合わせました。\n反映前のDB: {backup.name} (「バックアップから復元」で戻せます)")
+
+    def restore_backup(self) -> None:
+        """自動バックアップ (data/backups/) を選んで、今のDBをその内容に戻す。今のDBも念のためバックアップしてから戻す"""
+        if self.database is None:
+            messagebox.showwarning("未接続", "先にデータベースを開いてください")
+            return
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        chosen = filedialog.askopenfilename(title="戻すバックアップ", initialdir=BACKUP_DIR, filetypes=[("SQLite DB", "*.db")])
+        if not chosen:
+            return
+        source = Path(chosen)
+        path = self.database.path
+        if source.resolve() == path.resolve():
+            return
+        if not messagebox.askyesno("バックアップから復元", f"今のDBを {source.name} の内容に戻します (今のDBもバックアップします)。よろしいですか?", icon="warning"):
+            return
+        current = backup_database(self.database.connection, "before-restore")
+        self._close_word_list()
+        self.database.close()
+        self.database = None
+        restored = sqlite3.connect(path)
+        backup = sqlite3.connect(source)
+        try:
+            backup.backup(restored)
+        finally:
+            backup.close()
+            restored.close()
+        self.open_database(path)
+        messagebox.showinfo("復元完了", f"{source.name} の内容に戻しました。\n戻す前のDB: {current.name}")
 
     def start_quiz(self) -> None:
         if self.database is None:

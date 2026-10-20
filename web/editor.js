@@ -311,6 +311,7 @@ async function syncEdits() {
   let edits = JSON.parse(editorBridge.pending_edits());
   let sent = 0;
   const conflictsLeft = [];
+  const warnings = [];
   for (let round = 0; edits.length && round < 2; round += 1) {
     const response = await fetchWithTimeout("api/edits", {
       method: "POST",
@@ -321,6 +322,7 @@ async function syncEdits() {
     const result = await response.json();
     editorBridge.finish_edits(JSON.stringify(result.applied));
     sent += result.applied.length;
+    if (result.warning) warnings.push(result.warning);
     const retry = [];
     for (const conflict of result.conflicts) {
       const choice = await askConflict(conflict);
@@ -334,7 +336,7 @@ async function syncEdits() {
     await persistEdits();
     edits = JSON.parse(editorBridge.pending_edits()).filter((edit) => retry.includes(edit.id));
   }
-  return { sent, conflicts: conflictsLeft.length };
+  return { sent, conflicts: conflictsLeft.length, warnings };
 }
 
 function askConflict(conflict) {
@@ -360,6 +362,10 @@ async function pullMaterials() {
   const response = await fetchWithTimeout("api/materials", {}, 60000);
   if (!response.ok) throw new Error(`Mac の応答 (教材): ${response.status}`);
   const { files } = await response.json();
+  const localFiles = JSON.parse(editorBridge.files()).length;
+  if (localFiles && Object.keys(files).length < localFiles * 0.5) {
+    throw guardError(`Mac の教材ファイル (${Object.keys(files).length}個) がこの端末 (${localFiles}個) よりかなり少ないため、教材の置き換えを止めました。Mac の materials フォルダを確認してください`);
+  }
   editorBridge.replace_materials(JSON.stringify(files));
   await persistAllMaterials();
   await persistEdits();

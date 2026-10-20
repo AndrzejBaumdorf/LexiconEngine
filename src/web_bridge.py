@@ -176,3 +176,16 @@ def apply_sync(content_path: str, rows_json: str) -> str:
         _db().replace_content_from(Path(content_path))
     added, skipped = _db().merge_history(json.loads(rows_json))
     return json.dumps({"added": added, "skipped": skipped})
+
+
+def content_check(content_path: str) -> str:
+    """Mac から受け取った単語データの単語数と、この端末の単語数。極端に少なければ置き換えない (Mac 側の事故の巻き込みを防ぐ)"""
+    import sqlite3
+
+    received = sqlite3.connect(content_path)
+    try:
+        content_words = received.execute("SELECT COUNT(*) FROM words").fetchone()[0]
+    finally:
+        received.close()
+    local_words = _db().connection.execute("SELECT COUNT(*) FROM words").fetchone()[0]
+    return json.dumps({"content_words": content_words, "local_words": local_words})
