@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import re
-from typing import NamedTuple
+
+from conjugation import ConjugationCell
 
 DEFINITE_ARTICLES = {
     # 性 → 格 → 冠詞。"pl" は複数
@@ -99,13 +100,6 @@ AUXILIARIES = {
 # 規則で活用を作れない動詞 (sein, haben, 話法の助動詞など)。分離動詞の動詞部分もこれで判定する
 IRREGULAR_VERBS = {"sein", "haben", "werden", "können", "müssen", "dürfen", "sollen", "wollen", "mögen", "wissen", "tun"}
 VOWELS = "aeiouäöüy"
-
-
-class ConjugationCell(NamedTuple):
-    person: str
-    tense: str
-    # 正解として認める形。先頭を表示に使う (fährst ab)
-    answers: list[str]
 
 
 def _needs_e(stem: str) -> bool:

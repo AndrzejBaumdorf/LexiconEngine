@@ -28,6 +28,15 @@ QUESTION_TYPES = [
 # 回答履歴の集計単位 (database.history_pool) の表示名
 POOL_LABELS = {MEANING_POOL: "意味", "gender": "性", "plural": "複数形", "valency": "格支配", "conjugation": "活用", "romanization": "転写"}
 
+# 意味を問う問題 (英→日・日→英・穴埋め) で、品詞を選んでいないときに最初から選んでおく品詞
+MEANING_QUESTION_TYPES = ("english_to_japanese", "japanese_to_english", "cloze")
+DEFAULT_MEANING_PARTS_OF_SPEECH = ("名詞", "動詞", "形容詞", "副詞")
+
+
+def default_parts_of_speech(question_type: str) -> tuple[str, ...]:
+    """出題範囲の品詞の初期値。意味の問題は主な品詞だけ、ほかの問題 (格支配の前置詞・活用の存在詞など) はすべて"""
+    return DEFAULT_MEANING_PARTS_OF_SPEECH if question_type in MEANING_QUESTION_TYPES else ()
+
 
 def available_question_types(language: str) -> list[str]:
     # 転写・性・複数形などの問題形式は、対応した言語 (韓国語・ドイツ語など) のときだけ選べる

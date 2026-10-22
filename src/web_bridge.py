@@ -8,7 +8,8 @@ from pathlib import Path
 from database import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, Question, QuizScope
 from languages import get_language
 from quiz_types import (
-    MAX_QUESTION_COUNT, POOL_LABELS, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types, question_label,
+    MAX_QUESTION_COUNT, POOL_LABELS, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types,
+    default_parts_of_speech, question_label,
 )
 
 
@@ -58,6 +59,8 @@ def setup_options(language: str = "") -> str:
         ] if language else [],
         "score_modes": [{"label": label, "value": value} for label, value in SCORE_MODE_LABELS.items()],
         "max_count": MAX_QUESTION_COUNT,
+        # 品詞を自分で選ぶまでの初期値 (問題形式ごと)
+        "default_parts_of_speech": {value: list(default_parts_of_speech(value)) for _, value in QUESTION_TYPES},
     }, ensure_ascii=False)
 
 

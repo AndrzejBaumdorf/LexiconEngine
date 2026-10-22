@@ -54,7 +54,9 @@ def find_cloze_spans(
         forms |= extra
     alternatives = _alternatives(forms)
     pattern = f"(?:{alternatives})" + "".join(r"\s+" + re.escape(token) for token in rest)
-    match = re.search(rf"(?<!\w){pattern}(?!\w)", sentence, re.IGNORECASE)
+    # 助詞などが続く言語 (韓国語) は、語尾が続いていても見出し語の部分だけを穴にする
+    ending = rf"(?=(?:{language_spec.cloze_suffix})*(?!\w))" if language_spec.cloze_suffix else r"(?!\w)"
+    match = re.search(rf"(?<!\w){pattern}{ending}", sentence, re.IGNORECASE)
     if match:
         return [match.span()]
     return None if rest else _compound_tail_spans(sentence, alternatives, language_spec)

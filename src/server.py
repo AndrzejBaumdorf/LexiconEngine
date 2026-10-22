@@ -1,4 +1,4 @@
-"""iPad などのブラウザ版 (web/) を配信し、Mac の DB と同期するサーバー。
+"""iPad や Windows PC などのブラウザ版 (web/) を配信し、Mac の DB と同期するサーバー。
 
     python src/server.py --setup-cert   # 最初に1回: HTTPS の証明書を作る (mkcert)
     python src/server.py                # 同期したいときに起動 → https://<Macの名前>.local:8443
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import shutil
 import socket
 import subprocess
 import sys
@@ -33,7 +34,7 @@ KEY_FILE = CERT_DIR / "key.pem"
 DEFAULT_PORT = 8443
 # ブラウザ版の Pyodide に読み込ませる Python ファイル (tkinter を使うものは含めない)
 BROWSER_MODULES = (
-    "cloze", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
+    "cloze", "conjugation", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
     "web_bridge", "web_editor",
 )
 
@@ -190,9 +191,13 @@ def setup_cert() -> None:
     subprocess.run(["mkcert", "-cert-file", str(CERT_FILE), "-key-file", str(KEY_FILE), *names], check=True)
     ca_root = Path(subprocess.run(["mkcert", "-CAROOT"], capture_output=True, text=True, check=True).stdout.strip())
     print(f"\n証明書を作りました: {', '.join(names)}")
+    # Windows はダブルクリックで証明書を入れられるよう、拡張子 .crt の写しも置く
+    shutil.copy(ca_root / "rootCA.pem", CERT_DIR / "rootCA.crt")
     print(f"\niPad には {ca_root / 'rootCA.pem'} を AirDrop で送り、次の2つを行ってください:")
     print("  1. 設定 → 一般 → VPNとデバイス管理 → ダウンロード済みプロファイル をインストール")
     print("  2. 設定 → 一般 → 情報 → 証明書信頼設定 → mkcert の認証局をオン")
+    print(f"\nWindows PC には {CERT_DIR / 'rootCA.crt'} をコピーし、PowerShell で次を実行してください:")
+    print("  certutil -user -addstore Root rootCA.crt")
     subprocess.run(["open", "-R", str(ca_root / "rootCA.pem")])
 
 
@@ -214,7 +219,7 @@ def main() -> None:
     if not secure:
         print("証明書がないので http で起動します (iPad でオフラインで使うには --setup-cert で証明書を作ってください)", file=sys.stderr)
     # 名前 (Callisto.local) で開けないときは IP アドレスでも試せるよう、開ける URL をすべて出す
-    print("iPad のブラウザで次のどれかを開いてください (接続の確認だけなら末尾に /api/version):")
+    print("iPad や PC のブラウザで次のどれかを開いてください (接続の確認だけなら末尾に /api/version):")
     for name in host_names():
         if name not in ("localhost", "127.0.0.1"):
             print(f"  {scheme}://{name}:{args.port}")

@@ -1555,7 +1555,7 @@ class LexiconDatabase:
             f"""
             SELECT w.id, w.word, w.language, w.separable_prefix, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency
             FROM words w JOIN parts_of_speech p ON p.word_id = w.id JOIN meanings m ON m.part_of_speech_id = p.id
-            WHERE (json_extract(m.forms, '$.present_3sg') IS NOT NULL OR json_extract(m.forms, '$.past') IS NOT NULL)
+            WHERE m.forms IS NOT NULL
               AND {scope_condition}
             """,
             scope_params,

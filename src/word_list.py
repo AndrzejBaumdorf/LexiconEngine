@@ -166,20 +166,20 @@ class WordList(tk.Toplevel):
         self.refresh()
 
     def show_conjugation_stats(self) -> None:
-        """人称 × 時制の正答率の表。苦手な人称・時制は動詞を問わず出題が増える (database._conjugation_candidates)"""
+        """人称 (韓国語は文体) × 時制の正答率の表。苦手な人称・時制は単語を問わず出題が増える (database._conjugation_candidates)"""
+        spec = get_language(self.language_var.get())
         stats = self.database.conjugation_stats(self.language_var.get())
         window = tk.Toplevel(self)
         window.title(f"活用の正答率 ({self.language_var.get()})")
-        tenses = ("現在", "過去", "現在完了")
-        tree = ttk.Treeview(window, columns=("person", *tenses), show="headings", height=6)
-        tree.heading("person", text="人称")
-        tree.column("person", width=90)
+        tenses = spec.conjugation_columns
+        tree = ttk.Treeview(window, columns=("person", *tenses), show="headings", height=len(spec.conjugation_rows))
+        tree.heading("person", text=spec.conjugation_row_label)
+        tree.column("person", width=100)
         for tense in tenses:
             tree.heading(tense, text=tense)
             tree.column(tense, width=120, anchor="e")
         tree.tag_configure("low", foreground="#c0392b")
-        persons = get_language(self.language_var.get()).conjugation_pronouns
-        for person in persons:
+        for person in spec.conjugation_rows:
             cells = [stats.get((person, tense)) for tense in tenses]
             texts = [f"{cell.accuracy:.0f}% ({cell.correct}/{cell.answered})" if cell and cell.answered else "" for cell in cells]
             worst = min((cell.accuracy for cell in cells if cell and cell.answered), default=None)
@@ -187,7 +187,7 @@ class WordList(tk.Toplevel):
         tree.grid(row=0, column=0, padx=10, pady=10)
         ttk.Label(
             window, foreground="gray",
-            text="活用クイズは 動詞の誤り率 × 人称の誤り率 × 時制の誤り率 に比例して出題します (セットの開始時と50問ごとに更新)",
+            text=f"活用クイズは 単語の誤り率 × {spec.conjugation_row_label}の誤り率 × 時制の誤り率 に比例して出題します (セットの開始時と50問ごとに更新)",
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
 
     def refresh(self) -> None:

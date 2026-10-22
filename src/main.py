@@ -13,7 +13,8 @@ from database import LexiconDatabase, QuizScope
 from languages import get_language
 from materials import MATERIALS_DIR, SAMPLE_JSON_PATH as DEFAULT_SAMPLE_JSON_PATH, file_label
 from quiz_types import (
-    MAX_QUESTION_COUNT, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types, question_label,
+    MAX_QUESTION_COUNT, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types, default_parts_of_speech,
+    question_label,
 )
 from word_editor import WordEditor
 from word_list import WordList
@@ -93,6 +94,9 @@ class QuizApp(tk.Tk):
         ttk.Label(frame, text="ファイル\n(未選択=すべて)").grid(row=4, column=0, sticky="nw", padx=5, pady=5)
         self.file_list = self._scope_list(frame, 4)
         self.scope_lists = (self.source_list, self.difficulty_list, self.part_of_speech_list, self.file_list)
+        # 品詞を自分で選ぶまでは、問題形式に合わせた初期値 (意味の問題は名詞・動詞・形容詞・副詞) を選んでおく
+        self.parts_of_speech_touched = False
+        self.part_of_speech_list.bind("<<ListboxSelect>>", lambda event: setattr(self, "parts_of_speech_touched", True))
 
         ttk.Label(frame, text="問題形式").grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.type_var = tk.StringVar()
@@ -153,6 +157,7 @@ class QuizApp(tk.Tk):
                 if value in selected:
                     listbox.selection_set(index)
         self._refresh_type_labels()
+        self._apply_default_parts_of_speech()
 
     def _scope(self) -> QuizScope:
         sources, difficulties, parts_of_speech, files = (self._selected_items(listbox) for listbox in self.scope_lists)
@@ -174,6 +179,16 @@ class QuizApp(tk.Tk):
         self.hint_check.state(["!disabled"] if is_cloze else ["disabled"])
         if not is_cloze:
             self.hint_var.set(False)
+        self._apply_default_parts_of_speech()
+
+    def _apply_default_parts_of_speech(self) -> None:
+        if self.parts_of_speech_touched or not self.type_var.get():
+            return
+        defaults = default_parts_of_speech(self._selected_type())
+        self.part_of_speech_list.selection_clear(0, "end")
+        for index, value in enumerate(self.part_of_speech_list.get(0, "end")):
+            if value in defaults:
+                self.part_of_speech_list.selection_set(index)
 
     def _selected_type(self) -> str:
         # 表示名は言語で変わるため、選択肢の位置で問題形式を判定する

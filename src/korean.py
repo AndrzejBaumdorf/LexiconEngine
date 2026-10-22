@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import random
 
+from conjugation import ConjugationCell
+
 
 SYLLABLE_START, SYLLABLE_END = 0xAC00, 0xD7A3
 INITIALS = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
@@ -172,3 +174,39 @@ def romanization_distractors(word: str, answer: str, count: int = 3) -> list[str
         if len(distractors) == count:
             break
     return distractors
+
+
+# --- 例文穴埋め ---
+
+# 名詞などの後ろに付く助詞・指定詞 (이다) の語尾。例文穴埋めでは、見出し語の後ろにこれらが続いていても見出し語だけを穴にする
+# (이것을 → _____을)。2つ以上続くこともある (에서는, 에게도, 複数の 들 + 이 = 아이들이)
+PARTICLES = (
+    "들", "이", "가", "을", "를", "은", "는", "의", "에", "에서", "에게", "에게서", "한테", "한테서", "께", "께서", "도", "만",
+    "로", "으로", "와", "과", "랑", "이랑", "하고", "보다", "처럼", "같이", "까지", "부터", "마다", "밖에", "쯤", "씩",
+    "나", "이나", "라도", "이라도", "요",
+    "이다", "이에요", "예요", "이었어요", "였어요", "입니다", "이었습니다", "였습니다", "이야", "야", "이지만", "지만",
+)
+PARTICLE_PATTERN = "|".join(sorted(PARTICLES, key=len, reverse=True))
+
+
+# --- 活用 (形容詞・動詞) ---
+
+# 活用クイズに出す形: 語形のキー → (文体, 形)。語形は見出しの意味ごとに登録する (languages.KOREAN の form_fields)
+CONJUGATION_FORMS = {
+    "hamnida": ("ハムニダ体", "現在"),
+    "haeyo": ("ヘヨ体", "現在"),
+    "haeyo_past": ("ヘヨ体", "過去"),
+    "haeyo_honorific": ("ヘヨ体", "尊敬現在"),
+}
+STYLES = ("ハムニダ体", "ヘヨ体")
+FORMS = ("現在", "過去", "尊敬現在")
+
+
+def conjugation_table(word: str, prefix: str | None, forms: dict, reflexive_case: str | None = None) -> list[ConjugationCell]:
+    """登録された語形をそのまま活用クイズの正解にする (規則から作らない。不規則活用を登録どおりに出題するため)"""
+    cells = []
+    for key, (style, form) in CONJUGATION_FORMS.items():
+        value = str(forms.get(key) or "").strip()
+        if value:
+            cells.append(ConjugationCell(style, form, [value]))
+    return cells

@@ -4,7 +4,7 @@
 
 const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
 const PY_MODULES = [
-  "cloze", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
+  "cloze", "conjugation", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
   "web_bridge", "web_editor",
 ];
 const APP_DIR = "/home/pyodide/app";
@@ -16,7 +16,11 @@ const MIDDLE_SCORE = 0.2;
 let pyodide = null;
 let bridge = null;
 let editorBridge = null;
-const state = { options: null, question: null, answered: false, list: null, sort: { key: null, descending: true } };
+const state = {
+  options: null, question: null, answered: false, list: null, sort: { key: null, descending: true },
+  // 品詞を自分で選んだか。選ぶまでは問題形式に合わせた初期値 (意味の問題は名詞・動詞・形容詞・副詞) にする
+  partsTouched: false,
+};
 
 const $ = (id) => document.getElementById(id);
 const call = (name, ...args) => JSON.parse(bridge[name](...args));
@@ -145,9 +149,11 @@ async function showSetup(language) {
   fillSelect($("score-mode"), options.score_modes, remembered.score_mode);
   $("count").max = options.max_count;
   if (remembered.count) $("count").value = remembered.count;
+  const sameLanguage = remembered.language === options.language;
+  state.partsTouched = sameLanguage && Boolean(remembered.parts_touched);
   for (const group of document.querySelectorAll(".scope-group")) {
     const key = group.dataset.key;
-    const selected = new Set(remembered.language === options.language ? (remembered.scope || {})[key] || [] : []);
+    const selected = new Set(sameLanguage ? (remembered.scope || {})[key] || [] : []);
     const container = group.querySelector(".chips");
     container.replaceChildren();
     for (const value of options.scope[key]) {
@@ -156,12 +162,15 @@ async function showSetup(language) {
       chip.className = "chip";
       chip.textContent = value;
       chip.setAttribute("aria-pressed", String(selected.has(value)));
-      chip.addEventListener("click", () => chip.setAttribute("aria-pressed", String(chip.getAttribute("aria-pressed") !== "true")));
+      chip.addEventListener("click", () => {
+        chip.setAttribute("aria-pressed", String(chip.getAttribute("aria-pressed") !== "true"));
+        if (key === "parts_of_speech") state.partsTouched = true;
+      });
       container.append(chip);
     }
     group.hidden = options.scope[key].length === 0;
   }
-  updateHintRow();
+  onQuestionTypeChanged();
   show("setup");
 }
 
@@ -170,8 +179,13 @@ function fillSelect(select, items, selected) {
   if (items.some((item) => item.value === selected)) select.value = selected;
 }
 
-function updateHintRow() {
+function onQuestionTypeChanged() {
   $("hint-row").hidden = $("question-type").value !== "cloze";
+  if (state.partsTouched) return;
+  const defaults = new Set(state.options.default_parts_of_speech[$("question-type").value] || []);
+  for (const chip of document.querySelectorAll('[data-key="parts_of_speech"] .chip')) {
+    chip.setAttribute("aria-pressed", String(defaults.has(chip.textContent)));
+  }
 }
 
 function currentSettings() {
@@ -185,6 +199,7 @@ function currentSettings() {
     count: Number($("count").value),
     score_mode: $("score-mode").value,
     hint: $("hint").checked,
+    parts_touched: state.partsTouched,
     scope,
   };
 }
@@ -508,7 +523,7 @@ function showDialog(title, body, buttons) {
 initEditorEvents();
 
 $("language").addEventListener("change", () => showSetup($("language").value));
-$("question-type").addEventListener("change", updateHintRow);
+$("question-type").addEventListener("change", onQuestionTypeChanged);
 $("start-button").addEventListener("click", startQuiz);
 $("answer-button").addEventListener("click", onAnswerButton);
 $("skip-button").addEventListener("click", () => submit(""));

@@ -85,6 +85,8 @@ class Language:
     reflexive_pronoun: str = ""
     # 例文穴埋めで、複合語の後半 (Stellenangebot の angebot) も穴にしてよいか
     compound_words: bool = False
+    # 例文穴埋めで、見出し語のすぐ後ろに続いてよい語尾の正規表現 (韓国語の助詞 이것을 の 을)。穴にするのは見出し語の部分だけ
+    cloze_suffix: str = ""
     # 複数形に付ける冠詞 (ドイツ語の die)。複数形クイズで答えの前に付けてもよい
     plural_article: str = ""
     # 入力形式の問題で、入力欄の横にボタンとして出す文字 (キーボードで打ちにくいウムラウトなど)
@@ -97,9 +99,13 @@ class Language:
     # conjugation_pronouns は答えの前に付けてもよい主語 (du fährst ab)
     conjugation_table: Callable[[str, str | None, dict, str | None], list] | None = None
     conjugation_pronouns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # 活用の正答率の表の行 (ドイツ語は人称、韓国語は文体) と列 (時制など)。行の見出しは conjugation_row_label
+    conjugation_rows: tuple[str, ...] = ()
+    conjugation_columns: tuple[str, ...] = ()
+    conjugation_row_label: str = "人称"
 
     def supports(self, question_type: str) -> bool:
-        """言語固有の問題形式 (転写・性・複数形) を出題できるか"""
+        """言語固有の問題形式 (転写・性・複数形・格支配・活用) を出題できるか"""
         if question_type == "romanization":
             return self.romanize is not None
         if question_type == "gender":
@@ -208,6 +214,8 @@ GERMAN = Language(
     valency_answers=german.valency_answers,
     conjugation_table=german.conjugation_table,
     conjugation_pronouns=german.PERSON_PRONOUNS,
+    conjugation_rows=german.PERSONS,
+    conjugation_columns=("現在", "過去", "現在完了"),
     separable_infix="zu",
     reflexive_pronoun="sich",
     compound_words=True,
@@ -217,9 +225,18 @@ KOREAN = Language(
     "Korean",
     ("한국어", "韓国語"),
     "韓",
-    parts_of_speech=("名詞", "代名詞", "数詞", "動詞", "形容詞", "存在詞", "副詞", "冠形詞", "感動詞", "接続詞", "熟語"),
+    parts_of_speech=("名詞", "代名詞", "数詞", "動詞", "形容詞", "存在詞", "副詞", "冠形詞", "感動詞", "接続詞", "助詞", "助動詞", "熟語"),
     romanize=korean.romanize,
     romanization_distractors=korean.romanization_distractors,
+    # 形容詞・動詞・存在詞は活用形を登録すると活用クイズに出る。出題の問題文には付けない (答えが見えてしまうため)
+    form_fields=dict.fromkeys(("動詞", "形容詞", "存在詞"), tuple(
+        FormField(key, f"{style}{form}", headword_format=None) for key, (style, form) in korean.CONJUGATION_FORMS.items()
+    )),
+    conjugation_table=korean.conjugation_table,
+    conjugation_rows=korean.STYLES,
+    conjugation_columns=korean.FORMS,
+    conjugation_row_label="文体",
+    cloze_suffix=korean.PARTICLE_PATTERN,
 )
 LANGUAGES = (ENGLISH, GERMAN, KOREAN)
 GENDERS = tuple(GENDER_NAMES)

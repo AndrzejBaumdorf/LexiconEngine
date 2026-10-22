@@ -344,7 +344,7 @@ function askConflict(conflict) {
   body.append(`${conflict.file}\n${conflict.reason}。どちらを残しますか?\n\n`);
   const versions = document.createElement("div");
   versions.className = "versions";
-  for (const [title, entry] of [["iPad の版", conflict.ipad_entry], ["Mac の版", conflict.mac_entry]]) {
+  for (const [title, entry] of [["この端末の版", conflict.ipad_entry], ["Mac の版", conflict.mac_entry]]) {
     const box = document.createElement("div");
     box.className = "version";
     box.textContent = `${title}\n${editorBridge.entry_summary(JSON.stringify(entry ?? null))}`;
@@ -354,7 +354,7 @@ function askConflict(conflict) {
   return showDialog(`競合: ${conflict.word}`, body, [
     { value: "later", label: "あとで決める", className: "ghost" },
     { value: "mac", label: "Mac の版を残す", className: "secondary" },
-    { value: "ipad", label: "iPad の版を残す" },
+    { value: "ipad", label: "この端末の版を残す" },
   ]);
 }
 
