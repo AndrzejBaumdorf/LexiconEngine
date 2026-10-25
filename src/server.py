@@ -19,24 +19,27 @@ from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
-from database import LexiconDatabase
-from backups import backup_database, backup_materials
-from edits import apply_edits, key_of, material_path
-from materials import MATERIALS_DIR, file_label, load_entries, material_paths, sync_paths
+from lexicon.db import LexiconDatabase
+from lexicon.backups import backup_database, backup_materials
+from lexicon.edits import apply_edits, key_of, material_path
+from lexicon.materials import MATERIALS_DIR, file_label, load_entries, material_paths, sync_paths
+from lexicon.paths import CERT_DIR, DEFAULT_DB_PATH, ROOT
 
-ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "src"
 WEB_DIR = ROOT / "web"
-DEFAULT_DB_PATH = ROOT / "data" / "lexicon.db"
-CERT_DIR = ROOT / "data" / "certs"
 CERT_FILE = CERT_DIR / "cert.pem"
 KEY_FILE = CERT_DIR / "key.pem"
 DEFAULT_PORT = 8443
-# ブラウザ版の Pyodide に読み込ませる Python ファイル (tkinter を使うものは含めない)
-BROWSER_MODULES = (
-    "cloze", "conjugation", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
-    "web_bridge", "web_editor",
-)
+# ブラウザ版の Pyodide に読み込ませるパッケージ (tkinter を使う desktop/ は含めない)
+BROWSER_PACKAGES = ("lexicon", "browser")
+
+
+def browser_modules() -> list[str]:
+    """ブラウザ版に送る Python ファイルの、src/ からの相対パス"""
+    return sorted(
+        path.relative_to(SRC_DIR).as_posix()
+        for package in BROWSER_PACKAGES for path in (SRC_DIR / package).rglob("*.py")
+    )
 
 app = Flask(__name__)
 app.config["DB_PATH"] = DEFAULT_DB_PATH
@@ -60,21 +63,30 @@ def favicon():
     return send_from_directory(WEB_DIR, "icon-180.png", mimetype="image/png")
 
 
-@app.get("/py/<name>.py")
+@app.get("/py/modules.json")
+def python_module_list():
+    """ブラウザ版が読み込む Python ファイルの一覧。オフライン用に service worker がキャッシュする"""
+    return jsonify(browser_modules())
+
+
+@app.get("/py/<path:name>")
 def python_module(name: str):
-    if name not in BROWSER_MODULES:
+    if name not in browser_modules():
         abort(404)
-    return send_from_directory(SRC_DIR, f"{name}.py", mimetype="text/x-python")
+    return send_from_directory(SRC_DIR, name, mimetype="text/x-python")
 
 
 @app.get("/api/version")
 def version():
     """ブラウザ版の Python ファイルと画面のファイルの版。変わっていればブラウザ側が読み込み直す"""
     digest = hashlib.sha256()
-    for path in [*(SRC_DIR / f"{name}.py" for name in BROWSER_MODULES), *sorted(WEB_DIR.rglob("*"))]:
+    modules = browser_modules()
+    for path in [*(SRC_DIR / name for name in modules), *sorted(WEB_DIR.rglob("*"))]:
         if path.is_file():
             digest.update(path.read_bytes())
-    return jsonify({"version": digest.hexdigest()[:16], "modules": list(BROWSER_MODULES)})
+            # ファイルの移動や追加でも版が変わるよう、名前も含める
+            digest.update(path.relative_to(ROOT).as_posix().encode())
+    return jsonify({"version": digest.hexdigest()[:16], "modules": modules})
 
 
 @app.post("/api/sync")

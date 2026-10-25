@@ -11,16 +11,15 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cloze import find_cloze_spans
-from edits import entry_hash, force_edit, key_of, material_path
-from entry_format import (
-    MEANING_KEYS, RELATION_TYPES, WORD_KEYS, entry_key, format_derivatives, format_examples, format_relations, merge_entry,
-    parse_derivatives, parse_examples, parse_relations,
+from lexicon.cloze import find_cloze_spans
+from lexicon.edits import entry_hash, force_edit, key_of, material_path
+from lexicon.entry_format import (
+    MEANING_KEYS, RELATION_TYPES, WORD_KEYS, describe_meaning, entry_key, format_examples, format_relations, meaning_rows, merge_entry,
+    parse_examples, parse_relations, set_meaning_rows,
 )
-from database import normalize_derivatives
-from languages import FORM_KEYS, LANGUAGES, find_language, get_language
-from materials import load_entries, save_entries
-import web_bridge
+from lexicon.languages import FORM_KEYS, LANGUAGES, find_language, get_language
+from lexicon.materials import load_entries, save_entries
+from browser import bridge
 
 MATERIALS_DIR = Path("/home/pyodide/materials")
 EDITS_PATH = Path("/home/pyodide/data/edits.json")
@@ -134,40 +133,40 @@ def load_entry(file: str, index: int) -> str:
     """見出しを入力欄の形にする"""
     entry = _entries(file)[index]
     meanings = []
-    for part in entry.get("parts_of_speech", []):
-        for meaning in part.get("meanings", []):
-            meaning = {"meaning_ja": meaning} if isinstance(meaning, str) else meaning
-            sentences, translations = format_examples(meaning.get("examples", []))
-            meanings.append({
-                "part_of_speech": part.get("part_of_speech") or part.get("name") or "",
-                "meaning_ja": meaning.get("meaning_ja", ""),
-                "forms": {key: meaning[key] for key in FORM_KEYS if meaning.get(key)},
-                "valency": ", ".join(meaning.get("valency", [])),
-                "synonyms": format_relations(meaning.get("synonyms", [])),
-                "antonyms": format_relations(meaning.get("antonyms", [])),
-                "examples": sentences,
-                "translations": translations,
-                # 入力欄にないキー (usages など) は保存時にそのまま戻す
-                "extra": {key: value for key, value in meaning.items() if key not in MEANING_KEYS},
-            })
+    for derived_word, part_of_speech, meaning in meaning_rows(entry):
+        sentences, translations = format_examples(meaning.get("examples", []))
+        meanings.append({
+            "derived_word": derived_word,
+            "part_of_speech": part_of_speech,
+            "meaning_ja": meaning.get("meaning_ja", ""),
+            "forms": {key: meaning[key] for key in FORM_KEYS if meaning.get(key)},
+            "valency": ", ".join(meaning.get("valency", [])),
+            "synonyms": format_relations(meaning.get("synonyms", [])),
+            "antonyms": format_relations(meaning.get("antonyms", [])),
+            "examples": sentences,
+            "translations": translations,
+            # 入力欄にないキー (usages など) は保存時にそのまま戻す
+            "extra": {key: value for key, value in meaning.items() if key not in MEANING_KEYS},
+        })
     return json.dumps({
         "word": entry.get("word", ""),
         "language": entry.get("language", "English"),
         "difficulty": entry.get("difficulty") or "",
         "source": entry.get("source") or "",
-        "derivatives": format_derivatives(normalize_derivatives(entry)),
         "meanings": meanings,
         "extra": {key: value for key, value in entry.items() if key not in WORD_KEYS},
     }, ensure_ascii=False)
 
 
-def _meaning_from_form(form: dict, language: str, word: str) -> tuple[str, dict, list[str]]:
+def _meaning_from_form(form: dict, language: str, word: str) -> tuple[str, str, dict, list[str]]:
     spec = get_language(language)
+    derived_word = form.get("derived_word", "").strip()
     part_of_speech = form.get("part_of_speech", "").strip()
     meaning_ja = form.get("meaning_ja", "").strip()
-    if not part_of_speech or not meaning_ja:
+    # 派生語は意味を省略して単語と品詞だけでも登録できる
+    if not part_of_speech or not (meaning_ja or derived_word):
         raise ValueError("各意味に品詞と意味を入力してください")
-    meaning: dict = {"meaning_ja": meaning_ja}
+    meaning: dict = {"meaning_ja": meaning_ja} if meaning_ja else {}
     for field in spec.fields_for(part_of_speech):
         value = str(form.get("forms", {}).get(field.key) or "").strip()
         if value:
@@ -183,13 +182,16 @@ def _meaning_from_form(form: dict, language: str, word: str) -> tuple[str, dict,
             meaning[key] = relations
     meaning.update(form.get("extra") or {})
     examples = parse_examples(form.get("examples", ""), form.get("translations", ""))
+    if examples and not meaning_ja:
+        raise ValueError(f"{derived_word}: 例文を付けるときは意味も入力してください")
+    word = derived_word or word
     unusable = [
         example["sentence"] for example in examples
         if word and not find_cloze_spans(example["sentence"], word, language, example.get("targets"), spec.cloze_forms(meaning))
     ]
     if examples:
         meaning["examples"] = examples
-    return part_of_speech, meaning, unusable
+    return derived_word, part_of_speech, meaning, unusable
 
 
 def _entry_from_form(form: dict) -> tuple[dict, list[str]]:
@@ -204,19 +206,13 @@ def _entry_from_form(form: dict) -> tuple[dict, list[str]]:
         entry["difficulty"] = form["difficulty"].strip()
     if form.get("source", "").strip():
         entry["source"] = form["source"].strip()
-    entry["parts_of_speech"] = []
+    rows = []
     unusable_all = []
     for meaning_form in form["meanings"]:
-        part_of_speech, meaning, unusable = _meaning_from_form(meaning_form, language, word)
+        derived_word, part_of_speech, meaning, unusable = _meaning_from_form(meaning_form, language, word)
         unusable_all += unusable
-        part = next((item for item in entry["parts_of_speech"] if item["part_of_speech"] == part_of_speech), None)
-        if part is None:
-            part = {"part_of_speech": part_of_speech, "meanings": []}
-            entry["parts_of_speech"].append(part)
-        part["meanings"].append(meaning)
-    derivatives = parse_derivatives(form.get("derivatives", ""))
-    if derivatives:
-        entry["derivatives"] = derivatives
+        rows.append((derived_word, part_of_speech, meaning))
+    set_meaning_rows(entry, rows)
     entry.update(form.get("extra") or {})
     return entry, unusable_all
 
@@ -258,7 +254,7 @@ def save_entry(file: str, index: int | None, form_json: str, confirmed: bool = F
     _write(file, entries)
     _record_edit(file, original, entry)
     if original is not None and entry_key(original) != entry_key(entry):
-        web_bridge.session.database.remove_entry(*entry_key(original))
+        bridge.session.database.remove_entry(*entry_key(original))
     _import_local(file)
     return json.dumps({"status": "saved", "message": f"{entry['word']} を{action}しました", "index": entries.index(entry)}, ensure_ascii=False)
 
@@ -268,7 +264,7 @@ def delete_entry(file: str, index: int) -> str:
     original = entries.pop(index)
     _write(file, entries)
     _record_edit(file, original, None)
-    web_bridge.session.database.remove_entry(*entry_key(original))
+    bridge.session.database.remove_entry(*entry_key(original))
     return json.dumps({"status": "deleted", "message": f"{original.get('word')} を削除しました"}, ensure_ascii=False)
 
 
@@ -286,7 +282,7 @@ def _write(file: str, entries: list[dict]) -> None:
 
 def _import_local(file: str) -> None:
     # この端末のDBにすぐ反映して、同期の前でも出題に使えるようにする
-    web_bridge.session.database.import_json(material_path(MATERIALS_DIR, file), file)
+    bridge.session.database.import_json(material_path(MATERIALS_DIR, file), file)
 
 
 # --- 同期 ---
@@ -337,13 +333,8 @@ def entry_summary(entry_json: str) -> str:
     if entry is None:
         return "(削除)"
     lines = [f"{entry.get('word', '')}  [{entry.get('difficulty') or '-'} / {entry.get('source') or '-'}]"]
-    for part in entry.get("parts_of_speech", []):
-        for meaning in part.get("meanings", []):
-            meaning = {"meaning_ja": meaning} if isinstance(meaning, str) else meaning
-            forms = " / ".join(str(meaning[key]) for key in FORM_KEYS if meaning.get(key))
-            lines.append(f"・({part.get('part_of_speech', '')}) {meaning.get('meaning_ja', '')}" + (f"  {forms}" if forms else ""))
-            lines += [f"    {example.get('sentence', '')}" for example in meaning.get("examples", [])]
-    derivatives = normalize_derivatives(entry)
-    if derivatives:
-        lines.append("派生語: " + format_derivatives(derivatives))
+    for derived_word, part_of_speech, meaning in meaning_rows(entry):
+        forms = " / ".join(str(meaning[key]) for key in FORM_KEYS if meaning.get(key))
+        lines.append("・" + describe_meaning(derived_word, part_of_speech, meaning) + (f"  {forms}" if forms else ""))
+        lines += [f"    {example.get('sentence', '')}" for example in meaning.get("examples", [])]
     return "\n".join(lines)

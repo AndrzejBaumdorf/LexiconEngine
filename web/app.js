@@ -1,12 +1,8 @@
-// LexiconEngine ブラウザ版。Pyodide で src/ の Python (database.py など) を動かし、
+// LexiconEngine ブラウザ版。Pyodide で src/ の Python (lexicon/ と browser/) を動かし、
 // DB はこの端末のブラウザ (IndexedDB) に保存する。Mac の server.py と同じ Wi-Fi にいるときに同期する。
 "use strict";
 
 const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
-const PY_MODULES = [
-  "cloze", "conjugation", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
-  "web_bridge", "web_editor",
-];
 const APP_DIR = "/home/pyodide/app";
 const DB_PATH = "/home/pyodide/data/lexicon.db";
 const CONTENT_PATH = "/home/pyodide/data/content.db";
@@ -105,15 +101,23 @@ async function boot() {
   pyodide.FS.mkdirTree("/home/pyodide/data");
   setLoading("アプリを読み込み中…");
   // まとめて取りに行く (オフラインのとき、1つずつだと Mac を待つ時間がファイルの数だけかかる)
-  const sources = await Promise.all(PY_MODULES.map(async (name) => {
-    const response = await fetch(`py/${name}.py`);
-    if (!response.ok) throw new Error(`${name}.py を読み込めません (${response.status})`);
+  // ファイルの一覧 (src/ からの相対パス、"lexicon/db/quiz.py" など) はサーバーが作る
+  const listResponse = await fetch("py/modules.json");
+  if (!listResponse.ok) throw new Error(`Python ファイルの一覧を読み込めません (${listResponse.status})`);
+  const modules = await listResponse.json();
+  const sources = await Promise.all(modules.map(async (name) => {
+    const response = await fetch(`py/${name}`);
+    if (!response.ok) throw new Error(`${name} を読み込めません (${response.status})`);
     return [name, await response.text()];
   }));
-  for (const [name, source] of sources) pyodide.FS.writeFile(`${APP_DIR}/${name}.py`, source);
+  for (const [name, source] of sources) {
+    const path = `${APP_DIR}/${name}`;
+    pyodide.FS.mkdirTree(path.slice(0, path.lastIndexOf("/")));
+    pyodide.FS.writeFile(path, source);
+  }
   pyodide.runPython(`import sys\nsys.path.insert(0, "${APP_DIR}")`);
-  bridge = pyodide.pyimport("web_bridge");
-  editorBridge = pyodide.pyimport("web_editor");
+  bridge = pyodide.pyimport("browser.bridge");
+  editorBridge = pyodide.pyimport("browser.editor");
   editorBridge.configure(MATERIALS_ROOT, EDITS_FILE);
   await restoreEditorFiles();
 

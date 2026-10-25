@@ -224,5 +224,5 @@ materials/
 
 # HTTPS certificates for the browser version (python src/server.py --setup-cert)
 data/certs/
-# Automatic backups (src/backups.py)
+# Automatic backups (src/lexicon/backups.py)
 data/backups/

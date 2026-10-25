@@ -10,8 +10,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from entry_format import entry_key
-from materials import load_entries, save_entries
+from lexicon.entry_format import entry_key
+from lexicon.materials import load_entries, save_entries
 
 
 def entry_hash(entry: dict) -> str:

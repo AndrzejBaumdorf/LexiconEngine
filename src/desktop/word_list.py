@@ -1,6 +1,6 @@
 """単語一覧 (単語帳の表)。単語ごとの誤答スコアと回答数を表にし、列見出しのクリックで並べ替える。
-意味・性・複数形・転写などを別々に集計し (database.history_pool)、それぞれ列にする。
-誤答スコアは「誤答スコア」モードの出題の重みと同じもの (database.incorrect_score) で、最初はこれの高い順に並べて色分けする。"""
+意味・性・複数形・転写などを別々に集計し (lexicon/db/scores.py の history_pool)、それぞれ列にする。
+誤答スコアは「誤答スコア」モードの出題の重みと同じもの (lexicon/db/scores.py の incorrect_score) で、最初はこれの高い順に並べて色分けする。"""
 from __future__ import annotations
 
 import tkinter as tk
@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 from tkinter import ttk
 from typing import NamedTuple
 
-from database import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, WordStats
-from languages import get_language
-from quiz_types import POOL_LABELS
+from lexicon.db import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, WordStats
+from lexicon.languages import get_language
+from lexicon.quiz_types import POOL_LABELS
 
 
 ALL_TYPES_LABEL = "すべて"

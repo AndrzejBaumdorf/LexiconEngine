@@ -1,4 +1,4 @@
-// ブラウザ版の単語エディタ。教材JSONの写しを編集し、未同期の編集として記録する (src/web_editor.py)。
+// ブラウザ版の単語エディタ。教材JSONの写しを編集し、未同期の編集として記録する (src/browser/editor.py)。
 // 同期のときに Mac へ送り、Mac の JSON に反映する。app.js の call / $ / idb* / dialog を使う。
 "use strict";
 
@@ -98,7 +98,7 @@ function newEntry() {
   const defaults = editorState.defaults;
   editorState.index = null;
   setLanguage(defaults.language);
-  fillForm({ word: "", language: defaults.language, difficulty: defaults.difficulty, source: defaults.source, derivatives: "", meanings: [], extra: {} });
+  fillForm({ word: "", language: defaults.language, difficulty: defaults.difficulty, source: defaults.source, meanings: [], extra: {} });
   addMeaningCard();
   $("ed-delete").hidden = true;
   $("editor-message").textContent = "新しい単語";
@@ -123,7 +123,6 @@ function fillForm(form) {
   $("ed-language").value = form.language;
   $("ed-difficulty").value = form.difficulty;
   $("ed-source").value = form.source;
-  $("ed-derivatives").value = form.derivatives;
   editorState.extra = form.extra || {};
   $("ed-meanings").replaceChildren();
   for (const meaning of form.meanings) addMeaningCard(meaning);
@@ -138,8 +137,9 @@ function addMeaningCard(meaning = {}) {
     <div class="card-head"><span class="card-title"></span><button type="button" class="ghost remove">意味を削除</button></div>
     <div class="grid2">
       <label>品詞<input class="pos" type="text" list="ed-parts"></label>
-      <label>意味<input class="meaning" type="text"></label>
+      <label>派生語 (見出し語の意味なら空欄)<input class="derived" type="text" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
     </div>
+    <label class="wide">意味<input class="meaning" type="text"></label>
     <div class="grid2 forms"></div>
     <div class="grid2">
       <label>類義語<input class="synonyms" type="text" autocapitalize="off" spellcheck="false"></label>
@@ -148,6 +148,7 @@ function addMeaningCard(meaning = {}) {
     <label>例文 (1行1文)<textarea class="examples" autocapitalize="off" spellcheck="false"></textarea></label>
     <label>和訳 (例文と同じ行)<textarea class="translations"></textarea></label>`;
   card.querySelector(".pos").value = meaning.part_of_speech || (editorState.spec.parts_of_speech[0] || "");
+  card.querySelector(".derived").value = meaning.derived_word || "";
   card.querySelector(".meaning").value = meaning.meaning_ja || "";
   card.querySelector(".synonyms").value = meaning.synonyms || "";
   card.querySelector(".antonyms").value = meaning.antonyms || "";
@@ -155,6 +156,7 @@ function addMeaningCard(meaning = {}) {
   card.querySelector(".translations").value = meaning.translations || "";
   card.valency = meaning.valency || "";
   card.querySelector(".pos").addEventListener("input", () => renderFormFields(card));
+  card.querySelector(".derived").addEventListener("input", numberCards);
   card.querySelector(".remove").addEventListener("click", () => {
     card.remove();
     editorState.dirty = true;
@@ -168,7 +170,8 @@ function addMeaningCard(meaning = {}) {
 
 function numberCards() {
   $("ed-meanings").querySelectorAll(".meaning-card").forEach((card, index) => {
-    card.querySelector(".card-title").textContent = `意味 ${index + 1}`;
+    const derived = card.querySelector(".derived").value.trim();
+    card.querySelector(".card-title").textContent = derived ? `意味 ${index + 1} (派生語 ${derived})` : `意味 ${index + 1}`;
   });
 }
 
@@ -224,6 +227,7 @@ function readForm() {
       saveFormFields(card);
       const fields = editorState.spec.form_fields[card.querySelector(".pos").value.trim()] || [];
       return {
+        derived_word: card.querySelector(".derived").value,
         part_of_speech: card.querySelector(".pos").value,
         meaning_ja: card.querySelector(".meaning").value,
         forms: Object.fromEntries(fields.map((field) => [field.key, card.forms[field.key] || ""])),
@@ -236,13 +240,12 @@ function readForm() {
       };
     })
     // 何も入力していない意味の欄は無視する
-    .filter((meaning) => meaning.meaning_ja.trim() || meaning.examples.trim() || meaning.synonyms.trim());
+    .filter((meaning) => meaning.derived_word.trim() || meaning.meaning_ja.trim() || meaning.examples.trim() || meaning.synonyms.trim());
   return {
     word: $("ed-word").value,
     language: $("ed-language").value,
     difficulty: $("ed-difficulty").value,
     source: $("ed-source").value,
-    derivatives: $("ed-derivatives").value,
     meanings,
     extra: editorState.extra,
   };
@@ -388,6 +391,10 @@ function initEditorEvents() {
   $("editor-new").addEventListener("click", () => confirmDiscard() && newEntry());
   $("ed-add-meaning").addEventListener("click", () => {
     addMeaningCard().querySelector(".pos").focus();
+    editorState.dirty = true;
+  });
+  $("ed-add-derivative").addEventListener("click", () => {
+    addMeaningCard().querySelector(".derived").focus();
     editorState.dirty = true;
   });
   $("ed-language").addEventListener("change", () => {

@@ -7,7 +7,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-BACKUP_DIR = Path(__file__).resolve().parent.parent / "data" / "backups"
+from lexicon.paths import BACKUP_DIR
+
 KEEP = 30
 
 

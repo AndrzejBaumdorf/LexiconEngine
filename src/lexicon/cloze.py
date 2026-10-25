@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from languages import Language, get_language, split_separable
+from lexicon.languages import Language, get_language, split_separable
 
 
 BLANK = "_____"

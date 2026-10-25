@@ -1,8 +1,8 @@
-"""問題形式と出題モードの一覧。デスクトップ版 (main.py) とブラウザ版 (web_bridge.py) で共通に使う。"""
+"""問題形式と出題モードの一覧。デスクトップ版 (desktop/app.py) とブラウザ版 (browser/bridge.py) で共通に使う。"""
 from __future__ import annotations
 
-from database import MEANING_POOL
-from languages import get_language
+from lexicon.db import MEANING_POOL
+from lexicon.languages import get_language
 
 SKIPPED_ANSWER = "(スキップ)"
 MAX_QUESTION_COUNT = 1000
@@ -25,7 +25,7 @@ QUESTION_TYPES = [
     ("活用", "conjugation"),
 ]
 
-# 回答履歴の集計単位 (database.history_pool) の表示名
+# 回答履歴の集計単位 (lexicon/db/scores.py の history_pool) の表示名
 POOL_LABELS = {MEANING_POOL: "意味", "gender": "性", "plural": "複数形", "valency": "格支配", "conjugation": "活用", "romanization": "転写"}
 
 # 意味を問う問題 (英→日・日→英・穴埋め) で、品詞を選んでいないときに最初から選んでおく品詞

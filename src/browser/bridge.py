@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from database import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, Question, QuizScope
-from languages import get_language
-from quiz_types import (
+from lexicon.db import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, Question, QuizScope
+from lexicon.languages import get_language
+from lexicon.quiz_types import (
     MAX_QUESTION_COUNT, POOL_LABELS, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types,
     default_parts_of_speech, question_label,
 )

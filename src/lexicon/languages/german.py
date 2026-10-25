@@ -6,9 +6,7 @@
 """
 from __future__ import annotations
 
-import re
-
-from conjugation import ConjugationCell
+from lexicon.languages.conjugation import ConjugationCell
 
 DEFINITE_ARTICLES = {
     # 性 → 格 → 冠詞。"pl" は複数

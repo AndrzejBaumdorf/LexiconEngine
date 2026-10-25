@@ -4,22 +4,26 @@
 // - 同期の API (/api/): キャッシュしない
 "use strict";
 
-const CACHE = "lexicon-engine-v3";
+const CACHE = "lexicon-engine-v4";
 const NETWORK_TIMEOUT = 3000;
 // Mac につながらなかったら、しばらくは待たずにキャッシュを使う (起動時に何度も待たないように)
 const OFFLINE_GRACE = 30000;
 let offlineUntil = 0;
 const APP_FILES = [
-  "./", "index.html", "app.js", "editor.js", "style.css", "manifest.webmanifest", "icon-180.png", "icon-512.png",
-  ...[
-    "cloze", "conjugation", "database", "edits", "english", "entry_format", "german", "korean", "languages", "materials", "quiz_types",
-    "web_bridge", "web_editor",
-  ].map((name) => `py/${name}.py`),
+  "./", "index.html", "app.js", "editor.js", "style.css", "manifest.webmanifest", "icon-180.png", "icon-512.png", "py/modules.json",
 ];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(APP_FILES)).then(() => self.skipWaiting()));
+  event.waitUntil(precache().then(() => self.skipWaiting()));
 });
+
+async function precache() {
+  // Python ファイルはサーバーの一覧 (py/modules.json) にあるものをすべてキャッシュする
+  const cache = await caches.open(CACHE);
+  await cache.addAll(APP_FILES);
+  const modules = await (await cache.match("py/modules.json")).json();
+  await cache.addAll(modules.map((name) => `py/${name}`));
+}
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(

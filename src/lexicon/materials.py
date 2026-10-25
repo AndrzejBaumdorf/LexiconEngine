@@ -4,10 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from languages import find_language
-
-MATERIALS_DIR = Path(__file__).resolve().parent.parent / "materials"
-SAMPLE_JSON_PATH = Path(__file__).resolve().parent.parent / "samples" / "sample_words.json"
+from lexicon.languages import find_language
+from lexicon.paths import MATERIALS_DIR, SAMPLE_JSON_PATH
 
 
 def file_label(path: Path, materials_dir: Path = MATERIALS_DIR) -> str:

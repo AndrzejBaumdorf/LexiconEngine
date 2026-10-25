@@ -1,18 +1,18 @@
-"""単語エディタの入力欄と JSON の見出しの相互変換。デスクトップ版 (word_editor.py) とブラウザ版で共通に使う。"""
+"""単語エディタの入力欄と JSON の見出しの相互変換。デスクトップ版 (desktop/word_editor.py) とブラウザ版で共通に使う。"""
 from __future__ import annotations
 
+import copy
 import re
 
-from cloze import find_cloze_spans, mark_spans, parse_marked
-from database import normalize_derivatives
-from languages import FORM_KEYS, split_separable
+from lexicon.cloze import find_cloze_spans, mark_spans, parse_marked
+from lexicon.db import normalize_derivatives
+from lexicon.languages import FORM_KEYS, split_separable
 
 
 RELATION_TYPES = ("synonyms", "antonyms")
 # フォームで編集するキー。これ以外 (usages など) は編集時もそのまま残す
 WORD_KEYS = ("word", "language", "difficulty", "source", "parts_of_speech", "derivatives", "related_words")
 MEANING_KEYS = ("meaning_ja", *FORM_KEYS, "valency", "synonyms", "antonyms", "examples")
-DERIVATIVE_PATTERN = re.compile(r"^(?P<word>[^=(（]+?)\s*[(（]\s*(?P<pos>[^)）]+?)\s*[)）]\s*(?:=\s*(?P<meaning>.*))?$")
 
 
 def parse_relations(text: str, part_of_speech: str) -> list[str | dict]:
@@ -35,28 +35,44 @@ def format_relations(relations: list[str | dict]) -> str:
     )
 
 
-def parse_derivatives(text: str) -> list[dict]:
-    # "placatory(形容詞)=なだめるような, placation(名詞)"
-    derivatives = []
-    for item in re.split(r"[,，]", text):
-        item = item.strip()
-        if not item:
+def meaning_rows(entry: dict) -> list[tuple[str, str, dict]]:
+    """見出し語の意味と派生語を、エディタの意味の一覧の形 (派生語, 品詞, 意味) に並べる。見出し語の意味は派生語が空"""
+    rows = []
+    for part in entry.get("parts_of_speech", []):
+        for meaning in part.get("meanings", []):
+            meaning = {"meaning_ja": meaning} if isinstance(meaning, str) else copy.deepcopy(meaning)
+            rows.append(("", part.get("part_of_speech") or part.get("name") or "", meaning))
+    for derivative in normalize_derivatives(entry):
+        meaning = {key: copy.deepcopy(value) for key, value in derivative.items() if key not in ("word", "part_of_speech")}
+        rows.append((derivative["word"], derivative["part_of_speech"], meaning))
+    return rows
+
+
+def set_meaning_rows(entry: dict, rows: list[tuple[str, str, dict]]) -> None:
+    """meaning_rows の逆。派生語が空か見出し語と同じ行は parts_of_speech に、それ以外は derivatives に入れる"""
+    word = split_separable(entry.get("word") or "")[0]
+    parts: list[dict] = []
+    derivatives: list[dict] = []
+    for derived_word, part_of_speech, meaning in rows:
+        if derived_word and split_separable(derived_word)[0] != word:
+            derivatives.append({"word": derived_word, "part_of_speech": part_of_speech, **meaning})
             continue
-        match = DERIVATIVE_PATTERN.match(item)
-        if match is None:
-            raise ValueError(f"派生語「{item}」は「placatory(形容詞)=なだめるような」の形で書いてください")
-        derivative = {"word": match["word"], "part_of_speech": match["pos"]}
-        if match["meaning"] and match["meaning"].strip():
-            derivative["meaning_ja"] = match["meaning"].strip()
-        derivatives.append(derivative)
-    return derivatives
+        part = next((item for item in parts if item["part_of_speech"] == part_of_speech), None)
+        if part is None:
+            part = {"part_of_speech": part_of_speech, "meanings": []}
+            parts.append(part)
+        part["meanings"].append(meaning)
+    entry["parts_of_speech"] = parts
+    entry.pop("related_words", None)
+    entry.pop("derivatives", None)
+    if derivatives:
+        entry["derivatives"] = derivatives
 
 
-def format_derivatives(derivatives: list[dict]) -> str:
-    return ", ".join(
-        f"{item['word']}({item['part_of_speech']})" + (f"={item['meaning_ja']}" if item.get("meaning_ja") else "")
-        for item in derivatives
-    )
+def describe_meaning(derived_word: str, part_of_speech: str, meaning: dict) -> str:
+    """意味の一覧などに出す1行。派生語は「→ placation」を前に付ける"""
+    text = f"({part_of_speech}) {meaning.get('meaning_ja') or '(意味なし)'}"
+    return f"→ {derived_word} {text}" if derived_word else text
 
 
 def parse_examples(sentences: str, translations: str) -> list[dict]:
@@ -130,10 +146,15 @@ def merge_entry(entries: list[dict], entry: dict) -> bool:
                 meanings.append(meaning)
             else:
                 _merge_meaning(existing_meaning, meaning)
-    derivatives = normalize_derivatives(existing)
-    known = {item["word"] for item in derivatives}
-    derivatives += [item for item in entry.get("derivatives", []) if item["word"] not in known]
-    existing.pop("related_words", None)
-    if derivatives:
-        existing["derivatives"] = derivatives
+    rows = meaning_rows(existing)
+    for derived_word, part_of_speech, meaning in meaning_rows({"derivatives": entry.get("derivatives", [])}):
+        same = next((
+            item for word, pos, item in rows
+            if (word, pos, item.get("meaning_ja")) == (derived_word, part_of_speech, meaning.get("meaning_ja"))
+        ), None)
+        if same is None:
+            rows.append((derived_word, part_of_speech, meaning))
+        else:
+            _merge_meaning(same, meaning)
+    set_meaning_rows(existing, rows)
     return True

@@ -5,9 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
-import english
-import german
-import korean
+from lexicon.languages import english, german, korean
 
 
 VOWELS = "aeiou"
@@ -182,6 +180,9 @@ class Language:
         return f"{word} ({' - '.join(suffixes)})" if suffixes else word
 
 
+KOREAN_PARTS_OF_SPEECH = ("名詞", "代名詞", "数詞", "動詞", "形容詞", "存在詞", "副詞", "冠形詞", "感動詞", "接続詞", "助詞", "助動詞", "熟語")
+
+
 ENGLISH = Language(
     "English",
     ("英語",),
@@ -225,13 +226,21 @@ KOREAN = Language(
     "Korean",
     ("한국어", "韓国語"),
     "韓",
-    parts_of_speech=("名詞", "代名詞", "数詞", "動詞", "形容詞", "存在詞", "副詞", "冠形詞", "感動詞", "接続詞", "助詞", "助動詞", "熟語"),
+    parts_of_speech=KOREAN_PARTS_OF_SPEECH,
     romanize=korean.romanize,
     romanization_distractors=korean.romanization_distractors,
-    # 形容詞・動詞・存在詞は活用形を登録すると活用クイズに出る。出題の問題文には付けない (答えが見えてしまうため)
-    form_fields=dict.fromkeys(("動詞", "形容詞", "存在詞"), tuple(
-        FormField(key, f"{style}{form}", headword_format=None) for key, (style, form) in korean.CONJUGATION_FORMS.items()
-    )),
+    # どの品詞にも元の漢字語 (가족 → 家族) を登録できる。形容詞・動詞・存在詞は活用形を登録すると活用クイズに出る。
+    # どちらも出題の問題文には付けない (答えが見えてしまうため)
+    form_fields={
+        part: (
+            FormField("hanja", "漢字", cloze_token=None, headword_format=None),
+            *(
+                FormField(key, f"{style}{form}", headword_format=None) for key, (style, form) in korean.CONJUGATION_FORMS.items()
+                if part in korean.CONJUGATED_PARTS_OF_SPEECH
+            ),
+        )
+        for part in KOREAN_PARTS_OF_SPEECH
+    },
     conjugation_table=korean.conjugation_table,
     conjugation_rows=korean.STYLES,
     conjugation_columns=korean.FORMS,

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import random
 
-from conjugation import ConjugationCell
+from lexicon.languages.conjugation import ConjugationCell
 
 
 SYLLABLE_START, SYLLABLE_END = 0xAC00, 0xD7A3
@@ -199,6 +199,8 @@ CONJUGATION_FORMS = {
     "haeyo_honorific": ("ヘヨ体", "尊敬現在"),
 }
 STYLES = ("ハムニダ体", "ヘヨ体")
+# 活用形の欄を出す品詞
+CONJUGATED_PARTS_OF_SPEECH = ("動詞", "形容詞", "存在詞")
 FORMS = ("現在", "過去", "尊敬現在")
 
 
