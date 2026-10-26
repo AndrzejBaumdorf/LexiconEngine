@@ -185,6 +185,11 @@ class SyncMixin:
             self.connection.execute(
                 "UPDATE answer_history SET word_id = (SELECT new_id FROM temp.word_map WHERE old_id = answer_history.word_id)"
             )
+            # 綴りを直した単語の既習の印も引き継ぐ
+            for (language, old), new in transfers.items():
+                self.connection.execute(
+                    "UPDATE OR IGNORE known_words SET word = ? WHERE language = ? AND word = ?", (new, language, old)
+                )
             self.connection.execute("DROP TABLE temp.word_map")
             self.connection.commit()
         finally:
@@ -239,6 +244,7 @@ class SyncMixin:
         exported = sqlite3.connect(path)
         try:
             exported.execute("DELETE FROM answer_history")
+            exported.execute("DELETE FROM known_words")
             exported.commit()
             exported.execute("VACUUM")
         finally:

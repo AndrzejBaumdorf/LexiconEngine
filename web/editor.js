@@ -98,7 +98,7 @@ function newEntry() {
   const defaults = editorState.defaults;
   editorState.index = null;
   setLanguage(defaults.language);
-  fillForm({ word: "", language: defaults.language, difficulty: defaults.difficulty, source: defaults.source, meanings: [], extra: {} });
+  fillForm({ word: "", language: defaults.language, difficulty: defaults.difficulty, source: defaults.source, meanings: [], derivatives: [], extra: {} });
   addMeaningCard();
   $("ed-delete").hidden = true;
   $("editor-message").textContent = "新しい単語";
@@ -126,6 +126,8 @@ function fillForm(form) {
   editorState.extra = form.extra || {};
   $("ed-meanings").replaceChildren();
   for (const meaning of form.meanings) addMeaningCard(meaning);
+  $("ed-derivatives").replaceChildren();
+  for (const derivative of form.derivatives || []) addDerivativeCard(derivative);
 }
 
 function addMeaningCard(meaning = {}) {
@@ -137,9 +139,8 @@ function addMeaningCard(meaning = {}) {
     <div class="card-head"><span class="card-title"></span><button type="button" class="ghost remove">意味を削除</button></div>
     <div class="grid2">
       <label>品詞<input class="pos" type="text" list="ed-parts"></label>
-      <label>派生語 (見出し語の意味なら空欄)<input class="derived" type="text" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <label>意味<input class="meaning" type="text"></label>
     </div>
-    <label class="wide">意味<input class="meaning" type="text"></label>
     <div class="grid2 forms"></div>
     <div class="grid2">
       <label>類義語<input class="synonyms" type="text" autocapitalize="off" spellcheck="false"></label>
@@ -148,7 +149,6 @@ function addMeaningCard(meaning = {}) {
     <label>例文 (1行1文)<textarea class="examples" autocapitalize="off" spellcheck="false"></textarea></label>
     <label>和訳 (例文と同じ行)<textarea class="translations"></textarea></label>`;
   card.querySelector(".pos").value = meaning.part_of_speech || (editorState.spec.parts_of_speech[0] || "");
-  card.querySelector(".derived").value = meaning.derived_word || "";
   card.querySelector(".meaning").value = meaning.meaning_ja || "";
   card.querySelector(".synonyms").value = meaning.synonyms || "";
   card.querySelector(".antonyms").value = meaning.antonyms || "";
@@ -156,7 +156,6 @@ function addMeaningCard(meaning = {}) {
   card.querySelector(".translations").value = meaning.translations || "";
   card.valency = meaning.valency || "";
   card.querySelector(".pos").addEventListener("input", () => renderFormFields(card));
-  card.querySelector(".derived").addEventListener("input", numberCards);
   card.querySelector(".remove").addEventListener("click", () => {
     card.remove();
     editorState.dirty = true;
@@ -168,10 +167,44 @@ function addMeaningCard(meaning = {}) {
   return card;
 }
 
+function addDerivativeCard(derivative = {}) {
+  // 派生語は単語・品詞・意味と例文だけを入力欄に出す。語形・類義語などは JSON に書いてあればそのまま残す
+  const card = document.createElement("div");
+  card.className = "meaning-card derivative-card";
+  card.keep = {
+    forms: derivative.forms || {}, valency: derivative.valency || "", synonyms: derivative.synonyms || "",
+    antonyms: derivative.antonyms || "", extra: derivative.extra || {},
+  };
+  card.innerHTML = `
+    <div class="card-head"><span class="card-title"></span><button type="button" class="ghost remove">派生語を削除</button></div>
+    <div class="grid2">
+      <label>派生語<input class="word" type="text" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <label>品詞<input class="pos" type="text" list="ed-parts"></label>
+    </div>
+    <label class="wide">意味 (省略可)<input class="meaning" type="text"></label>
+    <label>例文 (1行1文)<textarea class="examples" autocapitalize="off" spellcheck="false"></textarea></label>
+    <label>和訳 (例文と同じ行)<textarea class="translations"></textarea></label>`;
+  card.querySelector(".word").value = derivative.word || "";
+  card.querySelector(".pos").value = derivative.part_of_speech || "";
+  card.querySelector(".meaning").value = derivative.meaning_ja || "";
+  card.querySelector(".examples").value = derivative.examples || "";
+  card.querySelector(".translations").value = derivative.translations || "";
+  card.querySelector(".remove").addEventListener("click", () => {
+    card.remove();
+    editorState.dirty = true;
+    numberCards();
+  });
+  $("ed-derivatives").append(card);
+  numberCards();
+  return card;
+}
+
 function numberCards() {
   $("ed-meanings").querySelectorAll(".meaning-card").forEach((card, index) => {
-    const derived = card.querySelector(".derived").value.trim();
-    card.querySelector(".card-title").textContent = derived ? `意味 ${index + 1} (派生語 ${derived})` : `意味 ${index + 1}`;
+    card.querySelector(".card-title").textContent = `意味 ${index + 1}`;
+  });
+  $("ed-derivatives").querySelectorAll(".meaning-card").forEach((card, index) => {
+    card.querySelector(".card-title").textContent = `派生語 ${index + 1}`;
   });
 }
 
@@ -227,7 +260,6 @@ function readForm() {
       saveFormFields(card);
       const fields = editorState.spec.form_fields[card.querySelector(".pos").value.trim()] || [];
       return {
-        derived_word: card.querySelector(".derived").value,
         part_of_speech: card.querySelector(".pos").value,
         meaning_ja: card.querySelector(".meaning").value,
         forms: Object.fromEntries(fields.map((field) => [field.key, card.forms[field.key] || ""])),
@@ -240,13 +272,24 @@ function readForm() {
       };
     })
     // 何も入力していない意味の欄は無視する
-    .filter((meaning) => meaning.derived_word.trim() || meaning.meaning_ja.trim() || meaning.examples.trim() || meaning.synonyms.trim());
+    .filter((meaning) => meaning.meaning_ja.trim() || meaning.examples.trim() || meaning.synonyms.trim());
+  const derivatives = [...$("ed-derivatives").querySelectorAll(".meaning-card")]
+    .map((card) => ({
+      ...card.keep,
+      word: card.querySelector(".word").value,
+      part_of_speech: card.querySelector(".pos").value,
+      meaning_ja: card.querySelector(".meaning").value,
+      examples: card.querySelector(".examples").value,
+      translations: card.querySelector(".translations").value,
+    }))
+    .filter((derivative) => derivative.word.trim() || derivative.meaning_ja.trim() || derivative.examples.trim());
   return {
     word: $("ed-word").value,
     language: $("ed-language").value,
     difficulty: $("ed-difficulty").value,
     source: $("ed-source").value,
     meanings,
+    derivatives,
     extra: editorState.extra,
   };
 }
@@ -288,23 +331,88 @@ async function afterEditorChange() {
   await saveDatabase();
 }
 
+function settingsForm(fields) {
+  // ファイルの場所・出典・レベルの入力欄。fields: [{key, label, value, list?}]
+  const form = document.createElement("div");
+  form.className = "settings-form";
+  for (const field of fields) {
+    const label = document.createElement("label");
+    label.textContent = field.label;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = field.key;
+    input.value = field.value || "";
+    input.autocapitalize = "off";
+    input.spellcheck = false;
+    if (field.list) input.setAttribute("list", field.list);
+    label.append(input);
+    form.append(label);
+  }
+  return form;
+}
+
+function formValues(form) {
+  return Object.fromEntries([...form.querySelectorAll("input")].map((input) => [input.name, input.value.trim()]));
+}
+
 async function createFile() {
-  const name = prompt("新しいファイルの場所 (例: German/A1A2_単語集/C_A1.json)", editorState.file.replace(/[^/]*$/, ""));
-  if (!name) return;
-  const file = name.trim().replace(/^\/+/, "");
+  const defaults = editorState.defaults || {};
+  const form = settingsForm([
+    { key: "file", label: "ファイルの場所 (例: German/A1A2_単語集/C_A1.json)", value: editorState.file.replace(/[^/]*$/, "") },
+    { key: "source", label: "出典 (このファイルの単語の初期値)", value: defaults.source, list: "ed-sources" },
+    { key: "difficulty", label: "レベル", value: defaults.difficulty },
+  ]);
+  const choice = await showDialog("新しいファイル", form, [
+    { value: "cancel", label: "やめる", className: "ghost" },
+    { value: "create", label: "作る" },
+  ]);
+  if (choice !== "create") return;
+  const values = formValues(form);
+  const file = values.file.replace(/^\/+/, "");
   if (!file.endsWith(".json")) {
     alert("ファイル名は .json で終わるようにしてください");
     return;
   }
-  const result = JSON.parse(editorBridge.create_file(file));
+  const result = JSON.parse(editorBridge.create_file(file, values.source, values.difficulty));
   if (result.status === "error") {
     alert(result.message);
     return;
   }
   await persistMaterial(file);
+  await persistEdits();
   const files = JSON.parse(editorBridge.files());
   fillSelect($("editor-file"), files.map((value) => ({ value, label: value })), file);
   openEditorFile(file);
+}
+
+async function editFileSettings() {
+  const defaults = editorState.defaults;
+  const form = settingsForm([
+    { key: "source", label: "出典", value: defaults.source, list: "ed-sources" },
+    { key: "difficulty", label: "レベル", value: defaults.difficulty },
+  ]);
+  const note = document.createElement("p");
+  note.className = "muted small";
+  const updateNote = () => {
+    const values = formValues(form);
+    const preview = JSON.parse(editorBridge.preview_file_settings(editorState.file, values.source, values.difficulty));
+    note.textContent = `${preview.total}語のうち ${preview.changed}語の出典・レベルが変わります。` +
+      "ファイルの値と違う出典・レベルにしてある単語はそのままです。新しく入力する単語の初期値にもなります。";
+  };
+  form.addEventListener("input", updateNote);
+  updateNote();
+  const body = document.createElement("div");
+  body.append(form, note);
+  const choice = await showDialog(`${editorState.file} の出典・レベル`, body, [
+    { value: "cancel", label: "やめる", className: "ghost" },
+    { value: "save", label: "変更する" },
+  ]);
+  if (choice !== "save") return;
+  const values = formValues(form);
+  const result = JSON.parse(editorBridge.set_file_settings(editorState.file, values.source, values.difficulty));
+  await afterEditorChange();
+  openEditorFile(editorState.file);
+  $("editor-message").textContent = `${result.message} (同期すると Mac に反映されます)`;
 }
 
 // --- 同期 (app.js の sync から呼ぶ) ---
@@ -387,6 +495,7 @@ function initEditorEvents() {
     else $("editor-file").value = editorState.file;
   });
   $("editor-new-file").addEventListener("click", () => confirmDiscard() && createFile());
+  $("editor-file-settings").addEventListener("click", () => confirmDiscard() && editFileSettings());
   $("editor-search").addEventListener("input", renderEntryList);
   $("editor-new").addEventListener("click", () => confirmDiscard() && newEntry());
   $("ed-add-meaning").addEventListener("click", () => {
@@ -394,7 +503,7 @@ function initEditorEvents() {
     editorState.dirty = true;
   });
   $("ed-add-derivative").addEventListener("click", () => {
-    addMeaningCard().querySelector(".derived").focus();
+    addDerivativeCard().querySelector(".word").focus();
     editorState.dirty = true;
   });
   $("ed-language").addEventListener("change", () => {

@@ -18,6 +18,8 @@ class WordStats(NamedTuple):
     # 集計の単位 (意味・性・複数形・転写) → 回答数と正答数
     pools: dict[str, PoolStats]
     last_answered: str | None
+    # 既習にした単語か (出題の基礎の重みが下がる)
+    known: bool = False
 
     def pool(self, name: str) -> PoolStats:
         return self.pools.get(name, PoolStats())
@@ -102,6 +104,7 @@ class StatsMixin:
             """,
             (language,),
         ).fetchall()
+        known = self.known_words(language)
         meanings: dict[int, list[str]] = {}
         for row in self.connection.execute(
             f"""
@@ -117,7 +120,7 @@ class StatsMixin:
         return [
             WordStats(
                 row["id"], mark_separable(row["word"], row["separable_prefix"]), row["parts_of_speech"] or "", " ／ ".join(meanings[row["id"]]),
-                row["sources"] or "", history.get(row["id"], {}), last_answered.get(row["id"]),
+                row["sources"] or "", history.get(row["id"], {}), last_answered.get(row["id"]), row["word"] in known,
             )
             for row in rows
         ]

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from lexicon.languages import FORM_KEYS, GENDERS, get_language, split_separable
+from lexicon.materials import apply_settings, split_payload
 from lexicon.db.text import valency_preposition
 
 
@@ -60,10 +61,8 @@ class ImportMixin:
         file_label = file_label or json_path.name
         with json_path.open(encoding="utf-8") as file:
             payload = json.load(file)
-
-        entries = [payload] if isinstance(payload, dict) else payload
-        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
-            raise ValueError("JSONのルートは単語オブジェクトまたは単語オブジェクトの配列にしてください")
+        # ファイルの設定 (出典・レベル) は、書いていない単語に入れる
+        entries = apply_settings(*split_payload(payload))
 
         # 同じファイルに同じ見出しが複数あってもまとめて扱えるよう、不要になった意味などの削除は最後に行う
         imported: dict[int, ImportedEntry] = {}

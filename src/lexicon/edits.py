@@ -3,6 +3,7 @@
 編集は「最後に同期したときこの見出しはこうだった (base) → こう変えた (entry)」の形で記録する。
 Mac 側の見出しが base のままなら変更を反映し、Mac でも変わっていれば競合として、どちらを残すかを利用者に選ばせる。
 見出しの同一性は entry_format.entry_key (単語×言語×出典×レベル)。
+ファイルの設定 (出典・レベル) の変更は {"settings": {...}} の編集として記録し、競合は判定せずに順番どおり反映する。
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import json
 from pathlib import Path
 
 from lexicon.entry_format import entry_key
-from lexicon.materials import load_entries, save_entries
+from lexicon.materials import change_settings, file_values, load_entries, load_settings, save_entries
 
 
 def entry_hash(entry: dict) -> str:
@@ -74,6 +75,12 @@ def apply_edit(entries: list[dict], edit: dict) -> tuple[str, dict | None, str]:
     return "applied", None, ""
 
 
+def apply_settings_edit(settings: dict, entries: list[dict], edit: dict) -> tuple[dict, list[dict]]:
+    """ファイルの設定の変更を反映した (設定, 単語の一覧)"""
+    new = edit["settings"]
+    return {**settings, **new}, change_settings(entries, file_values(settings, entries), new)
+
+
 def force_edit(entries: list[dict], edit: dict) -> None:
     """競合を気にせず編集どおりにする (未同期の編集を、Mac から受け取った教材に重ねて表示するため)"""
     base_key, new = edit.get("base_key"), edit.get("entry")
@@ -98,9 +105,13 @@ def apply_edits(edits: list[dict], materials_dir: Path) -> dict:
         by_file.setdefault(edit["file"], []).append(edit)
     for file, file_edits in by_file.items():
         path = material_path(materials_dir, file)
-        entries = load_entries(path)
-        before = json.dumps(entries, ensure_ascii=False)
+        settings, entries = load_settings(path), load_entries(path)
+        before = json.dumps([settings, entries], ensure_ascii=False)
         for edit in file_edits:
+            if "settings" in edit:
+                settings, entries = apply_settings_edit(settings, entries, edit)
+                applied.append(edit["id"])
+                continue
             result, mac_entry, reason = apply_edit(entries, edit)
             if result == "applied":
                 applied.append(edit["id"])
@@ -113,7 +124,7 @@ def apply_edits(edits: list[dict], materials_dir: Path) -> dict:
                     "id": edit["id"], "file": file, "reason": reason, "word": edit.get("word", ""),
                     "mac_entry": mac_entry, "ipad_entry": edit.get("entry"),
                 })
-        if json.dumps(entries, ensure_ascii=False) != before:
-            save_entries(path, entries)
+        if json.dumps([settings, entries], ensure_ascii=False) != before:
+            save_entries(path, entries, settings)
             changed.append(file)
     return {"applied": applied, "conflicts": conflicts, "renames": renames, "changed": changed}

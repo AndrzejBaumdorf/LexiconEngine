@@ -10,13 +10,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from lexicon.backups import BACKUP_DIR, backup_database
-from lexicon.db import LexiconDatabase, QuizScope
+from lexicon.db import TEST_QUESTION_TYPES, LexiconDatabase, QuizScope
 from lexicon.languages import get_language
 from lexicon.materials import MATERIALS_DIR, SAMPLE_JSON_PATH as DEFAULT_SAMPLE_JSON_PATH, file_label
 from lexicon.paths import DEFAULT_DB_PATH
 from lexicon.quiz_types import (
-    MAX_QUESTION_COUNT, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types, default_parts_of_speech,
-    question_label,
+    MAX_QUESTION_COUNT, MAX_TEST_ROUNDS, QUESTION_TYPES, QUIZ_MODE_LABELS, SKIPPED_ANSWER, TEST_MODE, available_question_types,
+    default_parts_of_speech, question_label,
 )
 from desktop.word_editor import WordEditor
 from desktop.word_list import WordList
@@ -40,6 +40,9 @@ class QuizApp(tk.Tk):
         self.correct_count = 0
         self.answered_count = 0
         self.show_hint = False
+        # テストモードの出題順 (単語ID) と1周の問題数。通常のモードでは None
+        self.test_order: list[int] | None = None
+        self.test_round_size = 0
         self.answer_var = tk.IntVar(value=-1)
         # 入力式の問題 (複数形など) の回答欄
         self.typed_answer_var = tk.StringVar()
@@ -97,7 +100,9 @@ class QuizApp(tk.Tk):
         self.scope_lists = (self.source_list, self.difficulty_list, self.part_of_speech_list, self.file_list)
         # 品詞を自分で選ぶまでは、問題形式に合わせた初期値 (意味の問題は名詞・動詞・形容詞・副詞) を選んでおく
         self.parts_of_speech_touched = False
-        self.part_of_speech_list.bind("<<ListboxSelect>>", lambda event: setattr(self, "parts_of_speech_touched", True))
+        self.part_of_speech_list.bind("<<ListboxSelect>>", lambda event: self._on_parts_of_speech_selected())
+        for listbox in (self.source_list, self.difficulty_list, self.file_list):
+            listbox.bind("<<ListboxSelect>>", lambda event: self._refresh_mastery())
 
         ttk.Label(frame, text="問題形式").grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.type_var = tk.StringVar()
@@ -105,24 +110,58 @@ class QuizApp(tk.Tk):
         self.type_box.grid(row=5, column=1, sticky="ew", padx=5, pady=5)
         self.type_box.bind("<<ComboboxSelected>>", self._on_type_selected)
 
-        ttk.Label(frame, text=f"出題数 (1〜{MAX_QUESTION_COUNT})").grid(row=6, column=0, sticky="w", padx=5, pady=5)
-        self.count_var = tk.StringVar(value="10")
-        ttk.Spinbox(frame, from_=1, to=MAX_QUESTION_COUNT, textvariable=self.count_var, width=5).grid(row=6, column=1, sticky="w", padx=5, pady=5)
+        # 習得率 = 1 - Σ未習得スコア / 単語数 (出題範囲でこの問題形式に出せる単語)
+        self.mastery_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.mastery_var, foreground="gray").grid(row=6, column=1, sticky="w", padx=5)
 
         ttk.Label(frame, text="出題モード").grid(row=7, column=0, sticky="w", padx=5, pady=5)
-        self.score_mode_var = tk.StringVar(value=next(iter(SCORE_MODE_LABELS)))
-        ttk.Combobox(frame, textvariable=self.score_mode_var, values=list(SCORE_MODE_LABELS), state="readonly", width=30).grid(
-            row=7, column=1, sticky="w", padx=5, pady=5
-        )
+        self.score_mode_var = tk.StringVar(value=next(iter(QUIZ_MODE_LABELS)))
+        mode_box = ttk.Combobox(frame, textvariable=self.score_mode_var, values=list(QUIZ_MODE_LABELS), state="readonly", width=50)
+        mode_box.grid(row=7, column=1, sticky="w", padx=5, pady=5)
+        mode_box.bind("<<ComboboxSelected>>", lambda event: self._on_mode_selected())
+
+        # 通常は出題数、テストモードは周回数
+        self.count_label_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.count_label_var).grid(row=8, column=0, sticky="w", padx=5, pady=5)
+        self.count_var = tk.StringVar(value="10")
+        self.rounds_var = tk.StringVar(value="1")
+        self.count_spinbox = ttk.Spinbox(frame, from_=1, to=MAX_QUESTION_COUNT, width=5)
+        self.count_spinbox.grid(row=8, column=1, sticky="w", padx=5, pady=5)
 
         self.hint_var = tk.BooleanVar(value=False)
         self.hint_check = ttk.Checkbutton(frame, text="日本語ヒントを表示する (穴埋めのみ)", variable=self.hint_var)
-        self.hint_check.grid(row=8, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
+        self.hint_check.grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
         self.hint_check.state(["disabled"])
 
         self.start_button = ttk.Button(frame, text="開始", command=self.start_quiz)
-        self.start_button.grid(row=9, column=1, sticky="e", padx=5, pady=(0, 5))
+        self.start_button.grid(row=10, column=1, sticky="e", padx=5, pady=(0, 5))
+        self._on_mode_selected()
         self._refresh_type_labels()
+
+    def _is_test_mode(self) -> bool:
+        return QUIZ_MODE_LABELS[self.score_mode_var.get()] == TEST_MODE
+
+    def _on_mode_selected(self) -> None:
+        if self._is_test_mode():
+            self.count_label_var.set(f"周回数 (1〜{MAX_TEST_ROUNDS})")
+            self.count_spinbox.configure(textvariable=self.rounds_var, to=MAX_TEST_ROUNDS)
+        else:
+            self.count_label_var.set(f"出題数 (1〜{MAX_QUESTION_COUNT})")
+            self.count_spinbox.configure(textvariable=self.count_var, to=MAX_QUESTION_COUNT)
+
+    def _on_parts_of_speech_selected(self) -> None:
+        self.parts_of_speech_touched = True
+        self._refresh_mastery()
+
+    def _refresh_mastery(self) -> None:
+        if self.database is None or not self.language_var.get() or not self.type_var.get():
+            self.mastery_var.set("")
+            return
+        try:
+            rate, words = self.database.mastery(self._selected_type(), self._scope())
+        except ValueError:
+            rate, words = 0.0, 0
+        self.mastery_var.set(f"習得率 {rate * 100:.1f}% ({words}語)" if words else "出題範囲にこの問題形式の単語がありません")
 
     def _scope_list(self, parent: ttk.Frame, row: int) -> tk.Listbox:
         container = ttk.Frame(parent)
@@ -159,6 +198,7 @@ class QuizApp(tk.Tk):
                     listbox.selection_set(index)
         self._refresh_type_labels()
         self._apply_default_parts_of_speech()
+        self._refresh_mastery()
 
     def _scope(self) -> QuizScope:
         sources, difficulties, parts_of_speech, files = (self._selected_items(listbox) for listbox in self.scope_lists)
@@ -181,6 +221,7 @@ class QuizApp(tk.Tk):
         if not is_cloze:
             self.hint_var.set(False)
         self._apply_default_parts_of_speech()
+        self._refresh_mastery()
 
     def _apply_default_parts_of_speech(self) -> None:
         if self.parts_of_speech_touched or not self.type_var.get():
@@ -488,9 +529,11 @@ class QuizApp(tk.Tk):
         if self.database is None:
             messagebox.showwarning("未接続", "先にデータベースを開いてください")
             return
-        count_text = self.count_var.get().strip()
-        if not count_text.isdigit() or not 1 <= int(count_text) <= MAX_QUESTION_COUNT:
-            messagebox.showwarning("入力エラー", f"出題数は1〜{MAX_QUESTION_COUNT}の整数で入力してください")
+        test_mode = self._is_test_mode()
+        count_text = (self.rounds_var if test_mode else self.count_var).get().strip()
+        limit = MAX_TEST_ROUNDS if test_mode else MAX_QUESTION_COUNT
+        if not count_text.isdigit() or not 1 <= int(count_text) <= limit:
+            messagebox.showwarning("入力エラー", f"{'周回数' if test_mode else '出題数'}は1〜{limit}の整数で入力してください")
             return
         if not self.language_var.get():
             messagebox.showwarning("単語がありません", "先に単語データを取り込んでください")
@@ -498,14 +541,26 @@ class QuizApp(tk.Tk):
         self.question_type = self._selected_type()
         self.quiz_language = self.language_var.get()
         self.quiz_scope = self._scope()
-        self.question_count = int(count_text)
+        # テストモードは範囲の単語を周回数分並べた順に出す
+        self.test_order, self.test_round_size = None, 0
+        if test_mode:
+            if self.question_type not in TEST_QUESTION_TYPES:
+                messagebox.showwarning("テストモード", "テストモードは「外→日」「日→外」の問題形式で使えます")
+                return
+            try:
+                self.test_order = self.database.test_word_ids(self.question_type, self.quiz_scope, int(count_text))
+            except ValueError as error:
+                messagebox.showwarning("テストモード", str(error))
+                return
+            self.test_round_size = len(self.test_order) // int(count_text)
+        self.question_count = len(self.test_order) if self.test_order is not None else int(count_text)
         self.question_index = 0
         self.correct_count = 0
         self.answered_count = 0
         self.show_hint = self.question_type == "cloze" and self.hint_var.get()
         self.score_var.set("")
         # 活用クイズの重みはセットの間は固定し、次のセットでこのセットの結果を反映する
-        self.database.begin_quiz_set(SCORE_MODE_LABELS[self.score_mode_var.get()])
+        self.database.begin_quiz_set("unlearned" if test_mode else QUIZ_MODE_LABELS[self.score_mode_var.get()])
         self._set_setup_enabled(False)
         self._set_quiz_active(True)
         self.next_question()
@@ -516,12 +571,16 @@ class QuizApp(tk.Tk):
             self.finish_quiz()
             return
         try:
-            self.question = self.database.create_question(self.question_type, self.show_hint, self.quiz_scope)
+            word_id = self.test_order[self.question_index - 1] if self.test_order is not None else None
+            self.question = self.database.create_question(self.question_type, self.show_hint, self.quiz_scope, word_id)
         except ValueError as error:
             messagebox.showerror("出題エラー", str(error))
             self.finish_quiz()
             return
-        self.progress_var.set(f"[{self.question_index}/{self.question_count}]")
+        progress = f"[{self.question_index}/{self.question_count}]"
+        if self.test_order is not None:
+            progress += f" テスト {(self.question_index - 1) // self.test_round_size + 1}周目"
+        self.progress_var.set(progress)
         self.prompt_var.set(self.question.prompt)
         self.feedback_var.set("")
         for widget in self.choices_frame.winfo_children():
@@ -595,7 +654,8 @@ class QuizApp(tk.Tk):
             prefix = "スキップ" if selected_answer == SKIPPED_ANSWER else "不正解"
             if self.question.is_typed and selected_answer != SKIPPED_ANSWER:
                 prefix += f" (入力: {selected_answer})"
-            self.feedback_var.set(f"{prefix}。正解は {self.question.answer_detail or self.question.answer} です。")
+            note = "\n(既習の印を外しました)" if self.database.unmarked_known else ""
+            self.feedback_var.set(f"{prefix}。正解は {self.question.answer_detail or self.question.answer} です。{note}")
             self.feedback_label.configure(foreground="red")
         is_last = self.question_index >= self.question_count
         self.answer_button.configure(text="結果を見る (Enter)" if is_last else "次の問題へ (Enter)", command=self.next_question)
@@ -618,6 +678,7 @@ class QuizApp(tk.Tk):
                 f"{self.quiz_language} {question_label(self.question.question_type, self.quiz_language)} 直近{total}問: {accuracy:.1f}% ({correct}/{total})"
             )
         self._refresh_word_list()
+        self._refresh_mastery()
 
     def _refresh_word_list(self) -> None:
         # 開いている単語一覧に今回の回答や取り込んだ単語を反映する

@@ -22,6 +22,11 @@ MIN_CONJUGATION_WEIGHT = 0.01
 # 長いセットでは、この問題数ごとに活用クイズの重みを回答履歴から計算し直す
 WEIGHT_REFRESH_INTERVAL = 50
 MEANING_SEPARATOR = "\x1f"
+# 出題の重みは「基礎の重み + 5 × スコア」。既習にした単語は基礎の重みを下げる
+BASE_WEIGHT = 1.0
+KNOWN_BASE_WEIGHT = 0.3
+# テストモード (範囲の単語を1周ずつ順番に出す) に使える問題形式
+TEST_QUESTION_TYPES = ("english_to_japanese", "japanese_to_english")
 
 
 class ClozeSentence(NamedTuple):
@@ -212,25 +217,90 @@ class QuizMixin:
             sentences.setdefault(row["word_id"], []).append(ClozeSentence(blank_out(row["sentence"], spans), form, surface, row["meaning_id"]))
         return sentences
 
-    def _weighted_word(self, question_type: str, scope: QuizScope, join: str = "", where: str = "1") -> sqlite3.Row:
+    def _target_filter(self, question_type: str, language: str | None) -> tuple[str, str]:
+        """問題形式ごとの、出題できる意味の条件 (JOIN 句, WHERE 句)。出題・テストモード・習得率で共通に使う"""
+        if question_type in ("english_to_japanese", "japanese_to_english", "romanization"):
+            return "", HAS_REAL_MEANING
+        if question_type == "cloze":
+            # 例文が属する意味を出題対象にする (例文の意味が分からない旧形式の例文は単語ごと)
+            sentences = self._cloze_sentences(language)
+            meaning_ids = {item.meaning_id for items in sentences.values() for item in items if item.meaning_id is not None}
+            unlinked_word_ids = {word_id for word_id, items in sentences.items() if any(item.meaning_id is None for item in items)}
+            return "", (
+                f"{HAS_REAL_MEANING} AND (m.id IN ({', '.join(map(str, meaning_ids)) or 'NULL'})"
+                f" OR w.id IN ({', '.join(map(str, unlinked_word_ids)) or 'NULL'}))"
+            )
+        if question_type == "gender":
+            return "", f"json_extract(m.forms, '$.gender') IN ({', '.join(repr(code) for code in GENDERS)})"
+        if question_type == "plural":
+            # 複数形なし (Ausland の "-" など) は出題しない
+            return "", f"TRIM(json_extract(m.forms, '$.plural')) NOT IN ({', '.join(repr(value) for value in NO_PLURAL)})"
+        if question_type == "derivative":
+            return "JOIN derivations d ON d.word_id = w.id", HAS_REAL_MEANING
+        if question_type == "valency":
+            return "", "m.id IN (SELECT meaning_id FROM examples WHERE valency IS NOT NULL AND meaning_id IS NOT NULL)"
+        if question_type == "relation":
+            return "", "m.id IN (SELECT meaning_id FROM meaning_relations)"
+        raise ValueError(f"未対応の問題形式です: {question_type}")
+
+    def _target_rows(self, question_type: str, scope: QuizScope, word_id: int | None = None) -> list[sqlite3.Row]:
+        """出題範囲で出題できる (単語, 意味) の一覧。known は既習にした単語なら 1"""
+        join, where = self._target_filter(question_type, scope.language)
         scope_condition, scope_params = scope.condition()
-        rows = self.connection.execute(
+        word_condition = "w.id = ?" if word_id is not None else "1"
+        return self.connection.execute(
             f"""
-            SELECT w.id, w.word, w.language, w.separable_prefix, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency
+            SELECT w.id, w.word, w.language, w.separable_prefix, p.name AS part_of_speech, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency,
+                EXISTS (SELECT 1 FROM known_words k WHERE k.language = w.language AND k.word = w.word AND k.known = 1) AS known
             FROM words w
             JOIN parts_of_speech p ON p.word_id = w.id
             JOIN meanings m ON m.part_of_speech_id = p.id
             {join}
-            WHERE {where} AND {scope_condition}
+            WHERE {where} AND {scope_condition} AND {word_condition}
             GROUP BY w.id, m.id
             ORDER BY RANDOM()
             """,
-            scope_params,
+            (*scope_params, *(() if word_id is None else (word_id,))),
         ).fetchall()
+
+    def _weighted_word(self, question_type: str, scope: QuizScope, word_id: int | None = None) -> sqlite3.Row:
+        """出題する (単語, 意味) を重み「基礎の重み + 5 × スコア」で選ぶ。word_id を指定するとその単語の意味から選ぶ (テストモード)"""
+        rows = self._target_rows(question_type, scope, word_id)
         if not rows:
             raise ValueError("出題範囲の条件に合う単語データがありません")
+        if word_id is not None:
+            return rows[0]
         scores = self._word_scores(question_type)
-        return random.choices(rows, weights=[1.0 + 5.0 * scores[row["id"]] for row in rows], k=1)[0]
+        return random.choices(
+            rows, weights=[(KNOWN_BASE_WEIGHT if row["known"] else BASE_WEIGHT) + 5.0 * scores[row["id"]] for row in rows], k=1,
+        )[0]
+
+    def test_word_ids(self, question_type: str, scope: QuizScope, rounds: int = 1) -> list[int]:
+        """テストモードの出題順。範囲の単語を1周ずつランダムな順で並べ、rounds 周分つなげる (周の境目で同じ単語が続かないようにする)"""
+        if question_type not in TEST_QUESTION_TYPES:
+            raise ValueError("テストモードは外→日・日→外の問題形式で使えます")
+        word_ids = sorted({row["id"] for row in self._target_rows(question_type, scope)})
+        if not word_ids:
+            raise ValueError("出題範囲の条件に合う単語データがありません")
+        order: list[int] = []
+        for _ in range(rounds):
+            lap = random.sample(word_ids, len(word_ids))
+            if order and len(lap) > 1 and lap[0] == order[-1]:
+                lap[0], lap[-1] = lap[-1], lap[0]
+            order += lap
+        return order
+
+    def mastery(self, question_type: str, scope: QuizScope) -> tuple[float, int]:
+        """習得率 = 1 - Σ未習得スコア / 単語数 (出題範囲でこの問題形式に出せる単語)。(習得率, 単語数) を返す。単語がなければ (0, 0)"""
+        if question_type == "conjugation":
+            word_ids = {candidate[0]["id"] for candidate in self._conjugation_candidates(scope)}
+        else:
+            word_ids = {row["id"] for row in self._target_rows(question_type, scope)}
+        if not word_ids:
+            return 0.0, 0
+        results = self._recent_results("h.question_type = ?", (question_type,))
+        scores = {word_id: unlearned_score(values) for (word_id, _), values in results.items()}
+        return 1.0 - sum(scores.get(word_id, 1.0) for word_id in word_ids) / len(word_ids), len(word_ids)
 
     def _word_scores(self, question_type: str) -> defaultdict[int, float]:
         """出題モードのスコアを単語ごとに返す。回答のない単語は、誤答スコアなら 0、未習得スコアなら 1"""
@@ -273,11 +343,16 @@ class QuizMixin:
         )]
         return [row[0] for row in sources], [row[0] for row in difficulties], [row[0] for row in parts_of_speech], with_folders(files)
 
-    def create_question(self, question_type: str, show_hint: bool = False, scope: QuizScope | None = None) -> Question:
+    def create_question(
+        self, question_type: str, show_hint: bool = False, scope: QuizScope | None = None, word_id: int | None = None,
+    ) -> Question:
+        """問題を作る。word_id を指定するとその単語を出す (テストモード。外→日・日→外だけ)"""
         scope = scope or QuizScope()
         language = scope.language
+        if word_id is not None and question_type not in TEST_QUESTION_TYPES:
+            raise ValueError("単語を指定して出題できるのは外→日・日→外だけです")
         if question_type == "english_to_japanese":
-            target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
+            target = self._weighted_word(question_type, scope, word_id)
             excluded_ids = self._choice_exclusion_ids(target["id"])
             choices = [target["meaning_ja"], *self._choice_candidates("m.meaning_ja", excluded_ids, target["part_of_speech"], target["meaning_ja"], target["language"], target["id"])]
             random.shuffle(choices)
@@ -286,7 +361,7 @@ class QuizMixin:
             prompt = get_language(target["language"]).headword(headword, json.loads(target["forms"] or "{}"))
             return Question(target["id"], question_type, prompt + valency_note(target["language"], target["valency"]), choices, target["meaning_ja"])
         if question_type == "japanese_to_english":
-            target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
+            target = self._weighted_word(question_type, scope, word_id)
             excluded_ids = self._choice_exclusion_ids(target["id"])
             choices = [target["word"], *self._choice_candidates("w.word", excluded_ids, target["part_of_speech"], target["word"], target["language"], target["id"])]
             random.shuffle(choices)
@@ -298,13 +373,7 @@ class QuizMixin:
                 raise ValueError("穴埋めに使える例文がありません")
             # 例文が属する意味を出題対象にし、品詞 (誤答の候補) とヒントをその意味に合わせる。
             # vent の動詞の例文で、名詞「通気孔」の品詞やヒントが使われないようにするため
-            meaning_ids = {item.meaning_id for items in sentences.values() for item in items if item.meaning_id is not None}
-            unlinked_word_ids = {word_id for word_id, items in sentences.items() if any(item.meaning_id is None for item in items)}
-            target = self._weighted_word(
-                question_type, scope,
-                where=f"{HAS_REAL_MEANING} AND (m.id IN ({', '.join(map(str, meaning_ids)) or 'NULL'})"
-                      f" OR w.id IN ({', '.join(map(str, unlinked_word_ids)) or 'NULL'}))",
-            )
+            target = self._weighted_word(question_type, scope)
             prompt, form, surface, _ = random.choice([
                 item for item in sentences[target["id"]] if item.meaning_id in (None, target["meaning_id"])
             ])
@@ -375,9 +444,7 @@ class QuizMixin:
         if question_type in ("romanization", "gender", "plural", "valency", "conjugation") and not get_language(language or "").supports(question_type):
             raise ValueError(f"{language} はこの問題形式に対応していません")
         if question_type == "gender":
-            target = self._weighted_word(
-                question_type, scope, where=f"json_extract(m.forms, '$.gender') IN ({', '.join(repr(code) for code in GENDERS)})"
-            )
+            target = self._weighted_word(question_type, scope)
             articles = get_language(target["language"]).articles
             gender = json.loads(target["forms"])["gender"]
             # der / die / das は毎回同じ並びで出す
@@ -390,11 +457,7 @@ class QuizMixin:
         if question_type == "conjugation":
             return self._conjugation_question(scope)
         if question_type == "plural":
-            # 複数形なし (Ausland の "-" など) は出題しない
-            target = self._weighted_word(
-                question_type, scope,
-                where=f"TRIM(json_extract(m.forms, '$.plural')) NOT IN ({', '.join(repr(value) for value in NO_PLURAL)})",
-            )
+            target = self._weighted_word(question_type, scope)
             forms = json.loads(target["forms"])
             language_spec = get_language(target["language"])
             answer = forms["plural"].strip()
@@ -407,7 +470,7 @@ class QuizMixin:
             )
         if question_type == "romanization":
             language_spec = get_language(language or "")
-            target = self._weighted_word(question_type, scope, where=HAS_REAL_MEANING)
+            target = self._weighted_word(question_type, scope)
             answer = language_spec.romanize(target["word"])
             if answer is None:
                 raise ValueError(f"{target['word']} を転写できません")
@@ -425,7 +488,7 @@ class QuizMixin:
             random.shuffle(choices)
             return Question(target["id"], question_type, f"{target['word']} ({target['meaning_ja']})", choices, answer)
         if question_type == "derivative":
-            target = self._weighted_word(question_type, scope, "JOIN derivations d ON d.word_id = w.id", HAS_REAL_MEANING)
+            target = self._weighted_word(question_type, scope)
             derivation = self.connection.execute(
                 """
                 SELECT w.word, d.part_of_speech
@@ -444,10 +507,7 @@ class QuizMixin:
     def _valency_question(self, scope: QuizScope) -> Question:
         """格支配クイズ。格支配の穴を持つ例文 (AI生成) の穴に、格変化させた句 (前置詞句・再帰代名詞) を入力させる。
         例: ab|holen 迎えに行く ｜ Mein Vater holt mich ___ ab. (der Bahnhof) → vom Bahnhof"""
-        target = self._weighted_word(
-            "valency", scope,
-            where="m.id IN (SELECT meaning_id FROM examples WHERE valency IS NOT NULL AND meaning_id IS NOT NULL)",
-        )
+        target = self._weighted_word("valency", scope)
         example = random.choice(self.connection.execute(
             "SELECT sentence, translation_ja, valency FROM examples WHERE meaning_id=? AND valency IS NOT NULL", (target["meaning_id"],)
         ).fetchall())
@@ -494,7 +554,8 @@ class QuizMixin:
         scope_condition, scope_params = scope.condition()
         rows = self.connection.execute(
             f"""
-            SELECT w.id, w.word, w.language, w.separable_prefix, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency
+            SELECT w.id, w.word, w.language, w.separable_prefix, m.id AS meaning_id, m.meaning_ja, m.forms, m.valency,
+                EXISTS (SELECT 1 FROM known_words k WHERE k.language = w.language AND k.word = w.word AND k.known = 1) AS known
             FROM words w JOIN parts_of_speech p ON p.word_id = w.id JOIN meanings m ON m.part_of_speech_id = p.id
             WHERE m.forms IS NOT NULL
               AND {scope_condition}
@@ -532,10 +593,14 @@ class QuizMixin:
             reflexive = next((item.rpartition("+")[2] for item in json.loads(row["valency"] or "[]") if item.startswith("sich+")), None)
             for cell in spec.conjugation_table(split_separable(row["word"])[0], row["separable_prefix"], json.loads(row["forms"]), reflexive):
                 weight = verb_rates.get(row["id"], 0.5) * person_rates.get(cell.person, 0.5) * tense_rates.get(cell.tense, 0.5)
+                # 既習にした動詞は、ほかの問題形式の基礎の重みと同じ割合で出にくくする
+                if row["known"]:
+                    weight *= KNOWN_BASE_WEIGHT / BASE_WEIGHT
                 candidates.append((row, cell, spec, max(weight, MIN_CONJUGATION_WEIGHT) / meanings_per_word[row["id"]]))
         return candidates
 
     def record_answer(self, question: Question, selected_answer: str) -> bool:
+        """回答を記録して正誤を返す。間違えた単語の既習の印を外したら unmarked_known が True になる"""
         correct = question.is_correct(selected_answer)
         self.connection.execute(
             "INSERT INTO answer_history(word_id, question_type, selected_answer, correct_answer, is_correct, variant, uid)"
@@ -546,4 +611,18 @@ class QuizMixin:
             ),
         )
         self.connection.commit()
+        # 既習にした単語を間違えたら (スキップも含む) 既習の印を外す
+        self.unmarked_known = not correct and self._unmark_known(question.word_id)
         return correct
+
+    def _unmark_known(self, word_id: int) -> bool:
+        """単語に既習の印があれば外す。外したら True"""
+        row = self.connection.execute(
+            "SELECT w.language, w.word FROM words w JOIN known_words k ON k.language = w.language AND k.word = w.word"
+            " WHERE w.id = ? AND k.known = 1",
+            (word_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        self.set_known(row["language"], row["word"], False)
+        return True

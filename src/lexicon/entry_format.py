@@ -35,28 +35,25 @@ def format_relations(relations: list[str | dict]) -> str:
     )
 
 
-def meaning_rows(entry: dict) -> list[tuple[str, str, dict]]:
-    """見出し語の意味と派生語を、エディタの意味の一覧の形 (派生語, 品詞, 意味) に並べる。見出し語の意味は派生語が空"""
-    rows = []
+def headword_meanings(entry: dict) -> list[tuple[str, dict]]:
+    """見出し語の意味を (品詞, 意味) の一覧にする (エディタの意味の一覧)"""
+    meanings = []
     for part in entry.get("parts_of_speech", []):
         for meaning in part.get("meanings", []):
             meaning = {"meaning_ja": meaning} if isinstance(meaning, str) else copy.deepcopy(meaning)
-            rows.append(("", part.get("part_of_speech") or part.get("name") or "", meaning))
-    for derivative in normalize_derivatives(entry):
-        meaning = {key: copy.deepcopy(value) for key, value in derivative.items() if key not in ("word", "part_of_speech")}
-        rows.append((derivative["word"], derivative["part_of_speech"], meaning))
-    return rows
+            meanings.append((part.get("part_of_speech") or part.get("name") or "", meaning))
+    return meanings
 
 
-def set_meaning_rows(entry: dict, rows: list[tuple[str, str, dict]]) -> None:
-    """meaning_rows の逆。派生語が空か見出し語と同じ行は parts_of_speech に、それ以外は derivatives に入れる"""
-    word = split_separable(entry.get("word") or "")[0]
+def entry_derivatives(entry: dict) -> list[dict]:
+    """派生語の一覧 (エディタの派生語の一覧)。各要素は word・part_of_speech と、meaning_ja・例文など意味と同じキー"""
+    return copy.deepcopy(normalize_derivatives(entry))
+
+
+def set_meanings(entry: dict, meanings: list[tuple[str, dict]], derivatives: list[dict]) -> None:
+    """headword_meanings・entry_derivatives の逆。品詞ごとにまとめて parts_of_speech に、派生語は derivatives に入れる"""
     parts: list[dict] = []
-    derivatives: list[dict] = []
-    for derived_word, part_of_speech, meaning in rows:
-        if derived_word and split_separable(derived_word)[0] != word:
-            derivatives.append({"word": derived_word, "part_of_speech": part_of_speech, **meaning})
-            continue
+    for part_of_speech, meaning in meanings:
         part = next((item for item in parts if item["part_of_speech"] == part_of_speech), None)
         if part is None:
             part = {"part_of_speech": part_of_speech, "meanings": []}
@@ -69,10 +66,13 @@ def set_meaning_rows(entry: dict, rows: list[tuple[str, str, dict]]) -> None:
         entry["derivatives"] = derivatives
 
 
-def describe_meaning(derived_word: str, part_of_speech: str, meaning: dict) -> str:
-    """意味の一覧などに出す1行。派生語は「→ placation」を前に付ける"""
-    text = f"({part_of_speech}) {meaning.get('meaning_ja') or '(意味なし)'}"
-    return f"→ {derived_word} {text}" if derived_word else text
+def describe_meaning(part_of_speech: str, meaning: dict) -> str:
+    """競合の確認画面などに出す1行"""
+    return f"({part_of_speech}) {meaning.get('meaning_ja') or '(意味なし)'}"
+
+
+def describe_derivative(derivative: dict) -> str:
+    return f"{derivative['word']} " + describe_meaning(derivative["part_of_speech"], derivative)
 
 
 def parse_examples(sentences: str, translations: str) -> list[dict]:
@@ -146,15 +146,16 @@ def merge_entry(entries: list[dict], entry: dict) -> bool:
                 meanings.append(meaning)
             else:
                 _merge_meaning(existing_meaning, meaning)
-    rows = meaning_rows(existing)
-    for derived_word, part_of_speech, meaning in meaning_rows({"derivatives": entry.get("derivatives", [])}):
+    derivatives = entry_derivatives(existing)
+    for derivative in entry_derivatives(entry):
         same = next((
-            item for word, pos, item in rows
-            if (word, pos, item.get("meaning_ja")) == (derived_word, part_of_speech, meaning.get("meaning_ja"))
+            item for item in derivatives
+            if [item.get(key) for key in ("word", "part_of_speech", "meaning_ja")]
+            == [derivative.get(key) for key in ("word", "part_of_speech", "meaning_ja")]
         ), None)
         if same is None:
-            rows.append((derived_word, part_of_speech, meaning))
+            derivatives.append(derivative)
         else:
-            _merge_meaning(same, meaning)
-    set_meaning_rows(existing, rows)
+            _merge_meaning(same, derivative)
+    set_meanings(existing, headword_meanings(existing), derivatives)
     return True

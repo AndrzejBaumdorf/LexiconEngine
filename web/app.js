@@ -151,8 +151,10 @@ async function showSetup(language) {
   fillSelect($("language"), options.languages.map((value) => ({ value, label: value })), options.language);
   fillSelect($("question-type"), options.question_types, remembered.question_type);
   fillSelect($("score-mode"), options.score_modes, remembered.score_mode);
-  $("count").max = options.max_count;
-  if (remembered.count) $("count").value = remembered.count;
+  // 出題数とテストモードの周回数は別々に覚えておく
+  state.count = remembered.count || 10;
+  state.rounds = remembered.rounds || 1;
+  onModeChanged();
   const sameLanguage = remembered.language === options.language;
   state.partsTouched = sameLanguage && Boolean(remembered.parts_touched);
   for (const group of document.querySelectorAll(".scope-group")) {
@@ -169,6 +171,7 @@ async function showSetup(language) {
       chip.addEventListener("click", () => {
         chip.setAttribute("aria-pressed", String(chip.getAttribute("aria-pressed") !== "true"));
         if (key === "parts_of_speech") state.partsTouched = true;
+        updateMastery();
       });
       container.append(chip);
     }
@@ -185,10 +188,40 @@ function fillSelect(select, items, selected) {
 
 function onQuestionTypeChanged() {
   $("hint-row").hidden = $("question-type").value !== "cloze";
-  if (state.partsTouched) return;
-  const defaults = new Set(state.options.default_parts_of_speech[$("question-type").value] || []);
-  for (const chip of document.querySelectorAll('[data-key="parts_of_speech"] .chip')) {
-    chip.setAttribute("aria-pressed", String(defaults.has(chip.textContent)));
+  if (!state.partsTouched) {
+    const defaults = new Set(state.options.default_parts_of_speech[$("question-type").value] || []);
+    for (const chip of document.querySelectorAll('[data-key="parts_of_speech"] .chip')) {
+      chip.setAttribute("aria-pressed", String(defaults.has(chip.textContent)));
+    }
+  }
+  updateMastery();
+}
+
+function isTestMode() {
+  return $("score-mode").value === state.options.test_mode;
+}
+
+function onModeChanged() {
+  // テストモードは出題数の代わりに周回数を選ぶ
+  const test = isTestMode();
+  $("count-label").textContent = test ? "周回数" : "出題数";
+  $("count").max = test ? state.options.max_rounds : state.options.max_count;
+  $("count").value = test ? state.rounds : state.count;
+}
+
+function updateMastery() {
+  // 習得率 = 1 - Σ未習得スコア / 単語数 (出題範囲でこの問題形式に出せる単語)
+  if (!$("question-type").value) {
+    $("mastery").textContent = "";
+    return;
+  }
+  try {
+    const result = call("mastery", JSON.stringify(currentSettings()));
+    $("mastery").textContent = result.words
+      ? `習得率 ${(result.rate * 100).toFixed(1)}% (${result.words}語)`
+      : "出題範囲にこの問題形式の単語がありません";
+  } catch (error) {
+    $("mastery").textContent = "";
   }
 }
 
@@ -201,6 +234,7 @@ function currentSettings() {
     language: $("language").value,
     question_type: $("question-type").value,
     count: Number($("count").value),
+    rounds: state.rounds,
     score_mode: $("score-mode").value,
     hint: $("hint").checked,
     parts_touched: state.partsTouched,
@@ -210,11 +244,18 @@ function currentSettings() {
 
 async function startQuiz() {
   const settings = currentSettings();
-  if (!Number.isInteger(settings.count) || settings.count < 1 || settings.count > state.options.max_count) {
-    alert(`出題数は1〜${state.options.max_count}の整数にしてください`);
+  const test = isTestMode();
+  const limit = test ? state.options.max_rounds : state.options.max_count;
+  if (!Number.isInteger(settings.count) || settings.count < 1 || settings.count > limit) {
+    alert(`${test ? "周回数" : "出題数"}は1〜${limit}の整数にしてください`);
     return;
   }
-  await idbPut("settings", settings);
+  if (test && !state.options.test_question_types.includes(settings.question_type)) {
+    alert("テストモードは「外→日」「日→外」の問題形式で使えます");
+    return;
+  }
+  // 覚えておく出題数は通常のモードのもの (テストモードの値は rounds に入れる)
+  await idbPut("settings", { ...settings, count: test ? state.count : settings.count });
   $("summary").textContent = "";
   try {
     showQuestion(call("start_quiz", JSON.stringify(settings)));
@@ -233,7 +274,7 @@ function showQuestion(question) {
   state.question = question;
   state.answered = false;
   show("quiz");
-  $("progress").textContent = `${question.index} / ${question.count}`;
+  $("progress").textContent = `${question.index} / ${question.count}` + (question.round ? ` (テスト ${question.round}周目)` : "");
   $("prompt").textContent = question.prompt;
   $("feedback").textContent = "";
   $("feedback").className = "feedback";
@@ -339,6 +380,8 @@ function loadWordList(keepType = false) {
 
 function listColumns() {
   const columns = [
+    // 既習の印。チェックした単語は出題の基礎の重みが下がる
+    { key: "known", label: "既習", value: (row) => (row.known ? 0 : 1), known: true },
     { key: "word", label: "単語", value: (row) => row.word.toLowerCase(), text: (row) => row.word, className: "word" },
     { key: "parts", label: "品詞", value: (row) => row.parts_of_speech, text: (row) => row.parts_of_speech },
     { key: "meanings", label: "意味", value: (row) => row.meanings, text: (row) => row.meanings },
@@ -409,6 +452,22 @@ function renderWordList() {
     tr.className = score == null ? "unanswered" : score >= HIGH_SCORE ? "high" : score >= MIDDLE_SCORE ? "middle" : "";
     for (const item of columns) {
       const td = document.createElement("td");
+      if (item.known) {
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = row.known;
+        box.setAttribute("aria-label", `${row.word} を既習にする`);
+        box.addEventListener("change", async () => {
+          row.known = box.checked;
+          bridge.set_known($("list-language").value, row.word, row.known);
+          await saveDatabase();
+          updateListStatus(rows.length, colorPool);
+        });
+        td.className = "known";
+        td.append(box);
+        tr.append(td);
+        continue;
+      }
       td.textContent = item.text(row);
       if (item.numeric) td.className = "num";
       if (item.className) td.className = item.className;
@@ -417,9 +476,15 @@ function renderWordList() {
     body.append(tr);
   }
   $("list-table").tBodies[0].replaceChildren(body);
+  updateListStatus(rows.length, colorPool);
+}
+
+function updateListStatus(shown, colorPool) {
   const poolLabel = state.list.pools.find((pool) => pool.value === colorPool).label;
+  const known = state.list.rows.filter((row) => row.known).length;
   $("list-status").textContent =
-    `表示 ${rows.length}語 / 全${state.list.rows.length}語 — ${poolLabel}の誤答スコア ${HIGH_SCORE} 以上は赤、${MIDDLE_SCORE} 以上は橙`;
+    `表示 ${shown}語 / 全${state.list.rows.length}語 (既習 ${known}語) — 既習にした単語は出にくくなります。` +
+    `${poolLabel}の誤答スコア ${HIGH_SCORE} 以上は赤、${MIDDLE_SCORE} 以上は橙`;
 }
 
 // --- 同期 ---
@@ -442,7 +507,7 @@ async function sync() {
     const response = await fetchWithTimeout("api/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: `{"rows": ${bridge.history_rows()}}`,
+      body: `{"rows": ${bridge.history_rows()}, "known": ${bridge.known_rows()}}`,
     }, 30000);
     if (!response.ok) throw new Error(`Mac の応答: ${response.status}`);
     const remote = await response.json();
@@ -461,6 +526,8 @@ async function sync() {
     // 置き換える前のこの端末の DB を1つ残しておく
     await idbPut("lexicon.db.before-sync", pyodide.FS.readFile(DB_PATH));
     const result = JSON.parse(bridge.apply_sync(CONTENT_PATH, JSON.stringify(remote.rows)));
+    // 既習の印は Mac でまとめたものに合わせる
+    bridge.merge_known(JSON.stringify(remote.known || []));
     pyodide.FS.unlink(CONTENT_PATH);
     // 4. 教材JSONの写しを Mac のものにする (まだ反映していない編集は重ねて残す)
     await pullMaterials();
@@ -528,6 +595,11 @@ initEditorEvents();
 
 $("language").addEventListener("change", () => showSetup($("language").value));
 $("question-type").addEventListener("change", onQuestionTypeChanged);
+$("score-mode").addEventListener("change", onModeChanged);
+$("count").addEventListener("input", () => {
+  if (isTestMode()) state.rounds = Number($("count").value);
+  else state.count = Number($("count").value);
+});
 $("start-button").addEventListener("click", startQuiz);
 $("answer-button").addEventListener("click", onAnswerButton);
 $("skip-button").addEventListener("click", () => submit(""));

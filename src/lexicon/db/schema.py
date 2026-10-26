@@ -96,6 +96,10 @@ class SchemaMixin:
             CREATE INDEX IF NOT EXISTS derivations_word ON derivations(word_id);
             CREATE INDEX IF NOT EXISTS derivations_derived_word ON derivations(derived_word_id);
             CREATE INDEX IF NOT EXISTS meaning_relations_related ON meaning_relations(related_meaning_id);
+            CREATE TABLE IF NOT EXISTS known_words (
+                language TEXT NOT NULL, word TEXT NOT NULL, known INTEGER NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (language, word)
+            );
             CREATE INDEX IF NOT EXISTS answer_history_type_word ON answer_history(question_type, word_id, id);
             CREATE INDEX IF NOT EXISTS answer_history_word ON answer_history(word_id);
             UPDATE answer_history SET uid = lower(hex(randomblob(16))) WHERE uid IS NULL;

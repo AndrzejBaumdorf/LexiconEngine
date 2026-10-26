@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from lexicon.db import MEANING_POOL, SEPARATE_POOL_TYPES, LexiconDatabase, Question, QuizScope
+from lexicon.db import MEANING_POOL, SEPARATE_POOL_TYPES, TEST_QUESTION_TYPES, LexiconDatabase, Question, QuizScope
 from lexicon.languages import get_language
 from lexicon.quiz_types import (
-    MAX_QUESTION_COUNT, POOL_LABELS, QUESTION_TYPES, SCORE_MODE_LABELS, SKIPPED_ANSWER, available_question_types,
-    default_parts_of_speech, question_label,
+    MAX_QUESTION_COUNT, MAX_TEST_ROUNDS, POOL_LABELS, QUESTION_TYPES, QUIZ_MODE_LABELS, SKIPPED_ANSWER, TEST_MODE,
+    available_question_types, default_parts_of_speech, question_label,
 )
 
 
@@ -25,6 +25,9 @@ class Session:
         self.index = 0
         self.answered = 0
         self.correct = 0
+        # テストモードの出題順 (単語ID) と1周の問題数。通常のモードでは None
+        self.test_order: list[int] | None = None
+        self.round_size = 0
 
 
 session = Session()
@@ -57,28 +60,50 @@ def setup_options(language: str = "") -> str:
         "question_types": [
             {"value": value, "label": question_label(value, language)} for value in available_question_types(language)
         ] if language else [],
-        "score_modes": [{"label": label, "value": value} for label, value in SCORE_MODE_LABELS.items()],
+        "score_modes": [{"label": label, "value": value} for label, value in QUIZ_MODE_LABELS.items()],
+        "test_mode": TEST_MODE,
+        "test_question_types": list(TEST_QUESTION_TYPES),
         "max_count": MAX_QUESTION_COUNT,
+        "max_rounds": MAX_TEST_ROUNDS,
         # 品詞を自分で選ぶまでの初期値 (問題形式ごと)
         "default_parts_of_speech": {value: list(default_parts_of_speech(value)) for _, value in QUESTION_TYPES},
     }, ensure_ascii=False)
 
 
-def start_quiz(settings_json: str) -> str:
-    settings = json.loads(settings_json)
-    count = int(settings["count"])
-    if not 1 <= count <= MAX_QUESTION_COUNT:
-        raise ValueError(f"出題数は1〜{MAX_QUESTION_COUNT}にしてください")
-    session.language = settings["language"]
-    session.question_type = settings["question_type"]
+def _scope(settings: dict) -> QuizScope:
     scope = settings.get("scope", {})
-    session.scope = QuizScope(
-        session.language, tuple(scope.get("sources", ())), tuple(scope.get("difficulties", ())),
+    return QuizScope(
+        settings["language"], tuple(scope.get("sources", ())), tuple(scope.get("difficulties", ())),
         tuple(scope.get("parts_of_speech", ())), tuple(scope.get("files", ())),
     )
+
+
+def mastery(settings_json: str) -> str:
+    """選んだ問題形式・出題範囲の習得率 (1 - Σ未習得スコア / 単語数)"""
+    settings = json.loads(settings_json)
+    rate, words = _db().mastery(settings["question_type"], _scope(settings))
+    return json.dumps({"rate": rate, "words": words})
+
+
+def start_quiz(settings_json: str) -> str:
+    """settings の score_mode が "test" ならテストモード (count は周回数)"""
+    settings = json.loads(settings_json)
+    count = int(settings["count"])
+    test_mode = settings.get("score_mode") == TEST_MODE
+    limit = MAX_TEST_ROUNDS if test_mode else MAX_QUESTION_COUNT
+    if not 1 <= count <= limit:
+        raise ValueError(f"{'周回数' if test_mode else '出題数'}は1〜{limit}にしてください")
+    session.language = settings["language"]
+    session.question_type = settings["question_type"]
+    session.scope = _scope(settings)
     session.show_hint = session.question_type == "cloze" and bool(settings.get("hint"))
+    session.test_order, session.round_size = None, 0
+    if test_mode:
+        session.test_order = _db().test_word_ids(session.question_type, session.scope, count)
+        session.round_size = len(session.test_order) // count
+        count = len(session.test_order)
     session.count, session.index, session.answered, session.correct = count, 0, 0, 0
-    _db().begin_quiz_set(settings.get("score_mode", "unlearned"))
+    _db().begin_quiz_set("unlearned" if test_mode else settings.get("score_mode", "unlearned"))
     return next_question()
 
 
@@ -87,7 +112,8 @@ def next_question() -> str:
     if session.index > session.count:
         return finish_quiz()
     try:
-        session.question = _db().create_question(session.question_type, session.show_hint, session.scope)
+        word_id = session.test_order[session.index - 1] if session.test_order is not None else None
+        session.question = _db().create_question(session.question_type, session.show_hint, session.scope, word_id)
     except ValueError as error:
         result = json.loads(finish_quiz())
         result["error"] = str(error)
@@ -102,6 +128,8 @@ def next_question() -> str:
         "typed": question.is_typed,
         "special_characters": get_language(session.language).special_characters if question.is_typed else "",
         "is_last": session.index >= session.count,
+        # テストモードなら何周目か
+        "round": (session.index - 1) // session.round_size + 1 if session.test_order is not None else None,
     }, ensure_ascii=False)
 
 
@@ -125,7 +153,7 @@ def answer(selected: str) -> str:
         prefix = "スキップ" if skipped else "不正解"
         if question.is_typed and not skipped:
             prefix += f" (入力: {selected})"
-        feedback = f"{prefix}。正解は {shown} です。"
+        feedback = f"{prefix}。正解は {shown} です。" + ("\n(既習の印を外しました)" if _db().unmarked_known else "")
     return json.dumps({"correct": correct, "feedback": feedback, "answer": question.answer}, ensure_ascii=False)
 
 
@@ -153,6 +181,7 @@ def word_list(language: str, meaning_question_type: str = "") -> str:
             "meanings": stats.meanings,
             "sources": stats.sources,
             "last_answered": stats.last_answered,
+            "known": stats.known,
             "pools": {pool: {"score": stats.pool(pool).incorrect, "answered": stats.pool(pool).answered, "correct": stats.pool(pool).correct} for pool in pools},
         })
     meaning_types = [
@@ -166,10 +195,22 @@ def word_list(language: str, meaning_question_type: str = "") -> str:
     }, ensure_ascii=False)
 
 
+def set_known(language: str, word: str, known: bool) -> None:
+    _db().set_known(language, word, bool(known))
+
+
 # --- 同期 (通信は JavaScript 側が行う) ---
 
 def history_rows() -> str:
     return json.dumps(_db().history_rows(), ensure_ascii=False)
+
+
+def known_rows() -> str:
+    return json.dumps(_db().known_rows(), ensure_ascii=False)
+
+
+def merge_known(rows_json: str) -> int:
+    return _db().merge_known(json.loads(rows_json))
 
 
 def apply_sync(content_path: str, rows_json: str) -> str:

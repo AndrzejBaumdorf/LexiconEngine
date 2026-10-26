@@ -11,11 +11,14 @@ from tkinter import filedialog, messagebox, ttk
 
 from lexicon.cloze import find_cloze_spans
 from lexicon.entry_format import (
-    MEANING_KEYS, RELATION_TYPES, WORD_KEYS, _relation_key, entry_key, format_examples, format_relations, meaning_rows, merge_entry,
-    parse_examples, parse_relations, set_meaning_rows,
+    MEANING_KEYS, RELATION_TYPES, WORD_KEYS, _relation_key, entry_derivatives, entry_key, format_examples, format_relations,
+    headword_meanings, merge_entry, parse_examples, parse_relations, set_meanings,
 )
 from lexicon.languages import FORM_KEYS, LANGUAGES, Language, get_language
-from lexicon.materials import MATERIALS_DIR, default_language, display_path, load_entries, material_files, resolve_material, save_entries
+from lexicon.materials import (
+    MATERIALS_DIR, change_settings, default_language, display_path, file_values, load_entries, load_settings, material_files,
+    resolve_material, save_entries,
+)
 
 
 LANGUAGE_NAMES = [language.name for language in LANGUAGES]
@@ -34,16 +37,18 @@ class WordEditor(tk.Toplevel):
         self.list_indices: list[int] = []
         self.current_index: int | None = None
         self.current_extra: dict = {}
-        # この単語の意味の一覧 (派生語, 品詞, 意味)。見出し語の意味は派生語が空
-        self.pending_parts: list[tuple[str, str, dict]] = []
+        # この単語の意味の一覧 (品詞, 意味) と派生語の一覧 ({word, part_of_speech, meaning_ja, examples, ...})
+        self.pending_parts: list[tuple[str, dict]] = []
+        self.pending_derivatives: list[dict] = []
         self.editing_meaning: int | None = None
+        self.editing_derivative: int | None = None
         self.dirty = False
         # このウィンドウで保存したJSON。クイズ画面から開いたときは閉じるときにDBへの取り込みを勧める
         self.saved_paths: set[Path] = set()
         self.on_close = on_close
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(3, weight=1)
+        self.rowconfigure(2, weight=1)
 
         file_frame = ttk.LabelFrame(self, text="保存先")
         file_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 5))
@@ -55,6 +60,9 @@ class WordEditor(tk.Toplevel):
         self.file_box.bind("<<ComboboxSelected>>", lambda event: self.load_file())
         self.file_box.bind("<Return>", lambda event: self.load_file())
         ttk.Button(file_frame, text="参照…", command=self.choose_file).grid(row=0, column=1, padx=5)
+        ttk.Button(file_frame, text="ファイルの出典・レベル…", command=self.edit_file_settings).grid(row=0, column=2, padx=5)
+        # ファイルの設定 (出典・レベル)。新しい単語の初期値と、まとめて変えるときの基準
+        self.file_settings: dict = {}
 
         self._build_word_list()
 
@@ -71,12 +79,18 @@ class WordEditor(tk.Toplevel):
         self._entry(word_frame, "難易度", self.difficulty_var, 1, 0)
         self.source_box = self._entry(word_frame, "出典", self.source_var, 1, 2, combobox=True)
 
-        meaning_frame = ttk.LabelFrame(self, text="意味")
-        meaning_frame.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=5)
+        # 意味と派生語はタブで切り替える (どちらも単語にぶら下がる)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=2, column=1, rowspan=2, sticky="nsew", padx=(0, 10), pady=5)
+        meaning_tab = ttk.Frame(self.notebook)
+        meaning_tab.columnconfigure(0, weight=1)
+        meaning_tab.rowconfigure(1, weight=1)
+        self.notebook.add(meaning_tab, text="意味")
+        meaning_frame = ttk.Frame(meaning_tab)
+        meaning_frame.grid(row=0, column=0, sticky="ew", pady=5)
         meaning_frame.columnconfigure(1, weight=1)
         meaning_frame.columnconfigure(3, weight=1)
         self.pos_var = tk.StringVar(value="名詞")
-        self.derived_var = tk.StringVar()
         self.meaning_var = tk.StringVar()
         # 語形 (性・複数形・動詞の活用) は欄を作り直しても入力値が残るよう、変数をキーごとに持つ
         self.form_vars = {key: tk.StringVar() for key in FORM_KEYS}
@@ -86,8 +100,6 @@ class WordEditor(tk.Toplevel):
         self.synonyms_var = tk.StringVar()
         self.antonyms_var = tk.StringVar()
         self.pos_box = self._entry(meaning_frame, "品詞", self.pos_var, 0, 0, combobox=True)
-        self._entry(meaning_frame, "派生語", self.derived_var, 0, 2)
-        ttk.Label(meaning_frame, text="派生語の意味を登録するときだけ派生語 (placation など) を入れる。空欄なら見出し語の意味", foreground="gray").grid(row=10, column=1, columnspan=3, sticky="w", padx=5)
         self.meaning_entry = self._entry(meaning_frame, "意味", self.meaning_var, 1, 0, columnspan=3)
         self.forms_frame = ttk.Frame(meaning_frame)
         self.forms_frame.grid(row=2, column=0, columnspan=4, sticky="ew")
@@ -109,16 +121,17 @@ class WordEditor(tk.Toplevel):
         ttk.Button(meaning_buttons, text="選択中の意味を更新", command=self.update_meaning).grid(row=0, column=1, padx=3)
         ttk.Button(meaning_buttons, text=f"意味を追加 ({SHORTCUT_LABEL}N)", command=self.add_meaning).grid(row=0, column=2, padx=3)
 
-        list_frame = ttk.LabelFrame(self, text="この単語の意味 (選択すると上の入力欄で編集できます)")
-        list_frame.grid(row=3, column=1, sticky="nsew", padx=(0, 10), pady=5)
+        list_frame = ttk.LabelFrame(meaning_tab, text="この単語の意味 (選択すると上の入力欄で編集できます)")
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=5)
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        columns = ("derived", "pos", "meaning", "forms", "synonyms", "antonyms", "examples")
+        columns = ("pos", "meaning", "forms", "synonyms", "antonyms", "examples")
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=5, selectmode="browse")
-        for column, heading, width in zip(columns, ("派生語", "品詞", "意味", "語形", "類義語", "対義語", "例文"), (100, 60, 200, 140, 120, 120, 50)):
+        for column, heading, width in zip(columns, ("品詞", "意味", "語形", "類義語", "対義語", "例文"), (60, 200, 140, 120, 120, 50)):
             self.tree.heading(column, text=heading)
-            self.tree.column(column, width=width, stretch=column not in ("derived", "pos", "examples"))
+            self.tree.column(column, width=width, stretch=column not in ("pos", "examples"))
         self.tree.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self._build_derivative_tab()
         self.language_var.trace_add("write", lambda *args: self.update_language_form())
         self.pos_var.trace_add("write", lambda *args: self.update_form_fields())
         self.update_language_form()
@@ -144,8 +157,156 @@ class WordEditor(tk.Toplevel):
         if event.state & SHIFT_MASK:
             self.new_word()
         else:
-            self.commit_meaning()
+            self.commit_derivative() if self._on_derivative_tab() else self.commit_meaning()
         return "break"
+
+    def _build_derivative_tab(self) -> None:
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        self.notebook.add(tab, text="派生語")
+        form = ttk.Frame(tab)
+        form.grid(row=0, column=0, sticky="ew", pady=5)
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(3, weight=1)
+        self.derivative_word_var = tk.StringVar()
+        self.derivative_pos_var = tk.StringVar()
+        self.derivative_meaning_var = tk.StringVar()
+        self.derivative_entry = self._entry(form, "派生語", self.derivative_word_var, 0, 0)
+        self.derivative_pos_box = self._entry(form, "品詞", self.derivative_pos_var, 0, 2, combobox=True)
+        self._entry(form, "意味", self.derivative_meaning_var, 1, 0, columnspan=3)
+        ttk.Label(form, text="見出し語から派生した単語 (reiterate → reiteration など)。意味は省略できます", foreground="gray").grid(row=2, column=1, columnspan=3, sticky="w", padx=5)
+        ttk.Label(form, text="例文 (1行1文)").grid(row=3, column=0, sticky="nw", padx=5, pady=3)
+        self.derivative_examples_text = tk.Text(form, height=3, wrap="word")
+        self.derivative_examples_text.grid(row=3, column=1, columnspan=3, sticky="ew", padx=5, pady=3)
+        ttk.Label(form, text="和訳 (例文と同じ行)").grid(row=4, column=0, sticky="nw", padx=5, pady=3)
+        self.derivative_translations_text = tk.Text(form, height=3, wrap="word")
+        self.derivative_translations_text.grid(row=4, column=1, columnspan=3, sticky="ew", padx=5, pady=3)
+        buttons = ttk.Frame(form)
+        buttons.grid(row=5, column=0, columnspan=4, sticky="e", padx=5, pady=5)
+        ttk.Button(buttons, text="入力欄をクリア", command=self.clear_derivative_form).grid(row=0, column=0, padx=3)
+        ttk.Button(buttons, text="選択中の派生語を更新", command=self.update_derivative).grid(row=0, column=1, padx=3)
+        ttk.Button(buttons, text=f"派生語を追加 ({SHORTCUT_LABEL}N)", command=self.add_derivative).grid(row=0, column=2, padx=3)
+
+        list_frame = ttk.LabelFrame(tab, text="この単語の派生語 (選択すると上の入力欄で編集できます)")
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        columns = ("word", "pos", "meaning", "examples")
+        self.derivative_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=5, selectmode="browse")
+        for column, heading, width in zip(columns, ("派生語", "品詞", "意味", "例文"), (160, 60, 300, 50)):
+            self.derivative_tree.heading(column, text=heading)
+            self.derivative_tree.column(column, width=width, stretch=column == "meaning")
+        self.derivative_tree.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.derivative_tree.bind("<<TreeviewSelect>>", self.on_derivative_selected)
+        ttk.Button(list_frame, text="選択を削除", command=self.remove_derivative).grid(row=1, column=0, sticky="w", padx=5, pady=(0, 5))
+
+    def _on_derivative_tab(self) -> bool:
+        return self.notebook.index(self.notebook.select()) == 1
+
+    def clear_derivative_form(self) -> None:
+        self.editing_derivative = None
+        for variable in (self.derivative_word_var, self.derivative_pos_var, self.derivative_meaning_var):
+            variable.set("")
+        self.derivative_examples_text.delete("1.0", "end")
+        self.derivative_translations_text.delete("1.0", "end")
+        self.derivative_tree.selection_remove(*self.derivative_tree.selection())
+
+    def _refresh_derivative_tree(self) -> None:
+        self.derivative_tree.delete(*self.derivative_tree.get_children())
+        for derivative in self.pending_derivatives:
+            self.derivative_tree.insert("", "end", values=(
+                derivative["word"], derivative["part_of_speech"], derivative.get("meaning_ja", ""), len(derivative.get("examples", [])),
+            ))
+
+    def on_derivative_selected(self, event: object = None) -> None:
+        selection = self.derivative_tree.selection()
+        if not selection:
+            return
+        self.editing_derivative = self.derivative_tree.index(selection[0])
+        derivative = self.pending_derivatives[self.editing_derivative]
+        self.derivative_word_var.set(derivative["word"])
+        self.derivative_pos_var.set(derivative["part_of_speech"])
+        self.derivative_meaning_var.set(derivative.get("meaning_ja", ""))
+        sentences, translations = format_examples(derivative.get("examples", []))
+        self.derivative_examples_text.delete("1.0", "end")
+        self.derivative_examples_text.insert("1.0", sentences)
+        self.derivative_translations_text.delete("1.0", "end")
+        self.derivative_translations_text.insert("1.0", translations)
+
+    def _derivative_from_form(self, base: dict) -> dict | None:
+        word = self.derivative_word_var.get().strip()
+        part_of_speech = self.derivative_pos_var.get().strip()
+        meaning_ja = self.derivative_meaning_var.get().strip()
+        if not word or not part_of_speech:
+            messagebox.showwarning("入力不足", "派生語と品詞を入力してください", parent=self)
+            return None
+        # 入力欄にないキー (語形・類義語など) は元のまま残す
+        derivative = {"word": word, "part_of_speech": part_of_speech}
+        if meaning_ja:
+            derivative["meaning_ja"] = meaning_ja
+        derivative.update({key: value for key, value in base.items() if key not in ("word", "part_of_speech", "meaning_ja", "examples")})
+        examples = parse_examples(self.derivative_examples_text.get("1.0", "end"), self.derivative_translations_text.get("1.0", "end"))
+        if examples and not meaning_ja:
+            messagebox.showwarning("入力不足", "例文を付けるときは意味も入力してください", parent=self)
+            return None
+        unusable = [
+            example["sentence"] for example in examples
+            if not find_cloze_spans(example["sentence"], word, self.language_var.get(), example.get("targets"), self._language().cloze_forms(derivative))
+        ]
+        if unusable and not self._confirm_unusable(unusable):
+            return None
+        if examples:
+            derivative["examples"] = examples
+        return derivative
+
+    def add_derivative(self) -> bool:
+        derivative = self._derivative_from_form({})
+        if derivative is None:
+            return False
+        self.pending_derivatives.append(derivative)
+        self._refresh_derivative_tree()
+        self.clear_derivative_form()
+        self.dirty = True
+        return True
+
+    def update_derivative(self) -> bool:
+        if self.editing_derivative is None:
+            messagebox.showwarning("未選択", "一覧から更新する派生語を選んでください", parent=self)
+            return False
+        derivative = self._derivative_from_form(self.pending_derivatives[self.editing_derivative])
+        if derivative is None:
+            return False
+        self.pending_derivatives[self.editing_derivative] = derivative
+        self._refresh_derivative_tree()
+        self.clear_derivative_form()
+        self.dirty = True
+        return True
+
+    def remove_derivative(self) -> None:
+        for item in self.derivative_tree.selection():
+            del self.pending_derivatives[self.derivative_tree.index(item)]
+        self._refresh_derivative_tree()
+        self.clear_derivative_form()
+        self.dirty = True
+
+    def commit_derivative(self) -> bool:
+        """派生語の入力欄の内容を確定する (意味の commit_meaning と同じ)"""
+        if not self.derivative_word_var.get().strip():
+            self.derivative_entry.focus_set()
+            return True
+        committed = self.update_derivative() if self.editing_derivative is not None else self.add_derivative()
+        if committed:
+            self.derivative_entry.focus_set()
+        return committed
+
+    def _confirm_unusable(self, unusable: list[str]) -> bool:
+        return messagebox.askyesno(
+            "穴埋めに使えない例文",
+            "次の例文は単語の位置を判定できないため穴埋めに出題されません。\n"
+            "例文中の該当箇所を [ ] で囲むと出題できます。このまま登録しますか?\n\n" + "\n".join(unusable),
+            parent=self,
+        )
 
     def _build_word_list(self) -> None:
         frame = ttk.LabelFrame(self, text="登録済みの単語")
@@ -172,6 +333,7 @@ class WordEditor(tk.Toplevel):
     def update_language_form(self) -> None:
         language = self._language()
         self.pos_box.configure(values=language.parts_of_speech)
+        self.derivative_pos_box.configure(values=language.parts_of_speech)
         if self.form_vars["gender"].get():
             self.form_vars["gender"].set(language.gender_label(self._gender_code()))
         columns = self.tree["columns"]
@@ -225,7 +387,7 @@ class WordEditor(tk.Toplevel):
         return (
             self.dirty
             or bool(self.meaning_var.get().strip())
-            or bool(self.derived_var.get().strip())
+            or bool(self.derivative_word_var.get().strip())
             or (self.current_index is None and bool(self.word_var.get().strip()))
         )
 
@@ -249,28 +411,79 @@ class WordEditor(tk.Toplevel):
         path = resolve_material(self.file_var.get())
         if path == self.loaded_path or not self.confirm_discard():
             return
+        if not path.exists() and not self.create_file(path):
+            self.file_var.set(display_path(self.loaded_path) if self.loaded_path else "")
+            return
         try:
-            entries = load_entries(path)
+            settings, entries = load_settings(path), load_entries(path)
         except (OSError, ValueError) as error:
             messagebox.showerror("読み込みに失敗しました", str(error), parent=self)
             return
         self.entries = entries
+        self.file_settings = settings
         self.loaded_path = path
         self.file_box.configure(values=material_files())
         self.clear_word()
-        # 言語・出典はファイル内の最後の単語に合わせ、空のファイルなら言語をフォルダ名から決める
+        # 言語はファイル内の最後の単語に合わせ、空のファイルならフォルダ名から決める。
+        # 出典・レベルはファイルの設定 (なければファイルで一番多い値) を新しい単語の初期値にする
         last_entry = entries[-1] if entries else {}
         self.language_var.set(last_entry.get("language") or default_language(path) or self.language_var.get())
-        self.source_var.set("")
+        values = file_values(settings, entries)
+        self.source_var.set(values["source"])
+        self.difficulty_var.set(values["difficulty"])
         self.refresh_sources()
         self.status_var.set(f"{display_path(path)}: {len(entries)}語")
 
+    def create_file(self, path: Path) -> bool:
+        """新しいファイルを、出典・レベルを決めてから作る"""
+        settings = ask_file_settings(
+            self, f"新しいファイル: {display_path(path)}", self.source_var.get(), self.difficulty_var.get(), self._known_sources(),
+            note="このファイルの単語の出典・レベルの初期値になります。あとから「ファイルの出典・レベル…」でまとめて変えられます。",
+        )
+        if settings is None:
+            return False
+        try:
+            save_entries(path, [], settings)
+        except OSError as error:
+            messagebox.showerror("ファイルを作れませんでした", str(error), parent=self)
+            return False
+        self.saved_paths.add(path)
+        return True
+
+    def edit_file_settings(self) -> None:
+        """ファイルの出典・レベルを変え、ファイルの値のままだった単語もまとめて変える"""
+        if self.loaded_path is None or not self.confirm_discard():
+            return
+        old = file_values(self.file_settings, self.entries)
+
+        def preview(settings: dict) -> str:
+            changed = change_settings(self.entries, old, settings)
+            count = sum(1 for before, after in zip(self.entries, changed) if before != after)
+            return (f"{len(self.entries)}語のうち {count}語の出典・レベルが変わります。"
+                    "ファイルの値と違う出典・レベルにしてある単語はそのままです。新しく入力する単語の初期値にもなります。")
+
+        settings = ask_file_settings(
+            self, f"{display_path(self.loaded_path)} の出典・レベル", old["source"], old["difficulty"], self._known_sources(), preview=preview,
+        )
+        if settings is None:
+            return
+        entries = change_settings(self.entries, old, settings)
+        try:
+            save_entries(self.loaded_path, entries, settings)
+        except OSError as error:
+            messagebox.showerror("保存に失敗しました", str(error), parent=self)
+            return
+        self.saved_paths.add(self.loaded_path)
+        count = sum(1 for before, after in zip(self.entries, entries) if before != after)
+        path, self.loaded_path = self.loaded_path, None
+        self.load_file()
+        self.status_var.set(f"{display_path(path)} の出典・レベルを変えました ({count}語を変更)")
+
+    def _known_sources(self) -> list[str]:
+        return sorted({entry["source"] for entry in self.entries if isinstance(entry.get("source"), str)})
+
     def refresh_sources(self) -> None:
-        sources = sorted({entry["source"] for entry in self.entries if isinstance(entry.get("source"), str)})
-        self.source_box.configure(values=sources)
-        last_source = next((entry["source"] for entry in reversed(self.entries) if isinstance(entry.get("source"), str)), "")
-        if last_source and not self.source_var.get():
-            self.source_var.set(last_source)
+        self.source_box.configure(values=self._known_sources())
 
     def refresh_word_list(self) -> None:
         query = self.search_var.get().strip().lower()
@@ -302,7 +515,7 @@ class WordEditor(tk.Toplevel):
     def load_entry(self, index: int) -> None:
         entry = self.entries[index]
         try:
-            rows = meaning_rows(entry)
+            meanings, derivatives = headword_meanings(entry), entry_derivatives(entry)
         except ValueError as error:
             messagebox.showerror("読み込めない単語データです", str(error), parent=self)
             return
@@ -313,7 +526,9 @@ class WordEditor(tk.Toplevel):
         self.language_var.set(entry.get("language", "English"))
         self.difficulty_var.set(entry.get("difficulty") or "")
         self.source_var.set(entry.get("source") or "")
-        self.pending_parts.extend(rows)
+        self.pending_parts.extend(meanings)
+        self.pending_derivatives.extend(derivatives)
+        self._refresh_derivative_tree()
         self._refresh_tree()
         self.refresh_word_list()
         self.status_var.set(f"編集中: {entry.get('word')}")
@@ -330,6 +545,9 @@ class WordEditor(tk.Toplevel):
         self.current_extra = {}
         self.word_var.set("")
         self.pending_parts.clear()
+        self.pending_derivatives.clear()
+        self.clear_derivative_form()
+        self._refresh_derivative_tree()
         self.clear_meaning_form()
         self._refresh_tree()
         self.refresh_word_list()
@@ -337,7 +555,7 @@ class WordEditor(tk.Toplevel):
 
     def clear_meaning_form(self) -> None:
         self.editing_meaning = None
-        for variable in (self.derived_var, self.meaning_var, self.synonyms_var, self.antonyms_var, self.valency_var, *self.form_vars.values()):
+        for variable in (self.meaning_var, self.synonyms_var, self.antonyms_var, self.valency_var, *self.form_vars.values()):
             variable.set("")
         self.examples_text.delete("1.0", "end")
         self.translations_text.delete("1.0", "end")
@@ -345,9 +563,8 @@ class WordEditor(tk.Toplevel):
 
     def _refresh_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
-        for derived_word, part_of_speech, meaning in self.pending_parts:
+        for part_of_speech, meaning in self.pending_parts:
             self.tree.insert("", "end", values=(
-                derived_word,
                 part_of_speech,
                 meaning.get("meaning_ja", ""),
                 " / ".join([
@@ -364,8 +581,7 @@ class WordEditor(tk.Toplevel):
         if not selection:
             return
         self.editing_meaning = self.tree.index(selection[0])
-        derived_word, part_of_speech, meaning = self.pending_parts[self.editing_meaning]
-        self.derived_var.set(derived_word)
+        part_of_speech, meaning = self.pending_parts[self.editing_meaning]
         self.pos_var.set(part_of_speech)
         self.meaning_var.set(meaning.get("meaning_ja", ""))
         for key, variable in self.form_vars.items():
@@ -380,15 +596,13 @@ class WordEditor(tk.Toplevel):
         self.translations_text.delete("1.0", "end")
         self.translations_text.insert("1.0", translations)
 
-    def _meaning_from_form(self, base: dict) -> tuple[str, str, dict] | None:
-        derived_word = self.derived_var.get().strip()
+    def _meaning_from_form(self, base: dict) -> tuple[str, dict] | None:
         part_of_speech = self.pos_var.get().strip()
         meaning_ja = self.meaning_var.get().strip()
-        # 派生語は意味を省略して単語と品詞だけでも登録できる
-        if not part_of_speech or not (meaning_ja or derived_word):
+        if not part_of_speech or not meaning_ja:
             messagebox.showwarning("入力不足", "品詞と意味を入力してください", parent=self)
             return None
-        meaning: dict = {"meaning_ja": meaning_ja} if meaning_ja else {}
+        meaning: dict = {"meaning_ja": meaning_ja}
         for form_field in self._language().fields_for(part_of_speech):
             value = self._gender_code() if form_field.key == "gender" else self.form_vars[form_field.key].get().strip()
             if value:
@@ -405,24 +619,16 @@ class WordEditor(tk.Toplevel):
                 meaning[key] = relations
         meaning.update({key: value for key, value in base.items() if key not in MEANING_KEYS})
         examples = parse_examples(self.examples_text.get("1.0", "end"), self.translations_text.get("1.0", "end"))
-        if examples and not meaning_ja:
-            messagebox.showwarning("入力不足", "例文を付けるときは意味も入力してください", parent=self)
-            return None
-        word = derived_word or self.word_var.get().strip()
+        word = self.word_var.get().strip()
         unusable = [
             example["sentence"] for example in examples
             if word and not find_cloze_spans(example["sentence"], word, self.language_var.get(), example.get("targets"), self._language().cloze_forms(meaning))
         ]
-        if unusable and not messagebox.askyesno(
-            "穴埋めに使えない例文",
-            "次の例文は単語の位置を判定できないため穴埋めに出題されません。\n"
-            "例文中の該当箇所を [ ] で囲むと出題できます。このまま登録しますか?\n\n" + "\n".join(unusable),
-            parent=self,
-        ):
+        if unusable and not self._confirm_unusable(unusable):
             return None
         if examples:
             meaning["examples"] = examples
-        return derived_word, part_of_speech, meaning
+        return part_of_speech, meaning
 
     def add_meaning(self) -> bool:
         result = self._meaning_from_form({})
@@ -438,7 +644,7 @@ class WordEditor(tk.Toplevel):
         if self.editing_meaning is None:
             messagebox.showwarning("未選択", "一覧から更新する意味を選んでください", parent=self)
             return False
-        result = self._meaning_from_form(self.pending_parts[self.editing_meaning][2])
+        result = self._meaning_from_form(self.pending_parts[self.editing_meaning][1])
         if result is None:
             return False
         self.pending_parts[self.editing_meaning] = result
@@ -460,7 +666,7 @@ class WordEditor(tk.Toplevel):
             entry["difficulty"] = self.difficulty_var.get().strip()
         if self.source_var.get().strip():
             entry["source"] = self.source_var.get().strip()
-        set_meaning_rows(entry, self.pending_parts)
+        set_meanings(entry, self.pending_parts, self.pending_derivatives)
         entry.update(self.current_extra)
         return entry
 
@@ -476,7 +682,7 @@ class WordEditor(tk.Toplevel):
 
     def commit_meaning(self) -> bool:
         """意味欄の内容を確定する。一覧で選んだ意味を編集中なら更新、そうでなければ追加し、次の意味の入力に移る。"""
-        if not self.meaning_var.get().strip() and not self.derived_var.get().strip():
+        if not self.meaning_var.get().strip():
             self.meaning_entry.focus_set()
             return True
         committed = self.update_meaning() if self.editing_meaning is not None else self.add_meaning()
@@ -493,7 +699,7 @@ class WordEditor(tk.Toplevel):
             messagebox.showwarning("入力不足", "単語を入力してください", parent=self)
             return
         # 意味欄に入力したまま保存した場合は、その意味も含める
-        if not self.commit_meaning():
+        if not self.commit_meaning() or not self.commit_derivative():
             return
         if not self.pending_parts:
             messagebox.showwarning("入力不足", "意味を1つ以上追加してください", parent=self)
@@ -536,6 +742,47 @@ class WordEditor(tk.Toplevel):
             self.clear_word()
             self.status_var.set(f"{word} を削除しました ({display_path(self.loaded_path)}: {len(entries)}語)")
 
+
+
+def ask_file_settings(
+    parent: tk.Misc, title: str, source: str, difficulty: str, sources: list[str],
+    note: str = "", preview: Callable[[dict], str] | None = None,
+) -> dict | None:
+    """ファイルの出典・レベルを入力する画面。やめたら None"""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.columnconfigure(1, weight=1)
+    source_var, difficulty_var, note_var = tk.StringVar(value=source), tk.StringVar(value=difficulty), tk.StringVar(value=note)
+    ttk.Label(dialog, text="出典").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 3))
+    ttk.Combobox(dialog, textvariable=source_var, values=sources, width=40).grid(row=0, column=1, sticky="ew", padx=10, pady=(10, 3))
+    ttk.Label(dialog, text="レベル").grid(row=1, column=0, sticky="w", padx=10, pady=3)
+    ttk.Entry(dialog, textvariable=difficulty_var).grid(row=1, column=1, sticky="ew", padx=10, pady=3)
+    ttk.Label(dialog, textvariable=note_var, foreground="gray", wraplength=420, justify="left").grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=5)
+    result: dict = {}
+
+    def values() -> dict:
+        return {"source": source_var.get().strip(), "difficulty": difficulty_var.get().strip()}
+
+    if preview:
+        update = lambda *args: note_var.set(preview(values()))
+        source_var.trace_add("write", update)
+        difficulty_var.trace_add("write", update)
+        update()
+
+    def accept() -> None:
+        result.update(values())
+        dialog.destroy()
+
+    buttons = ttk.Frame(dialog)
+    buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=10, pady=10)
+    ttk.Button(buttons, text="やめる", command=dialog.destroy).grid(row=0, column=0, padx=3)
+    ttk.Button(buttons, text="OK", command=accept).grid(row=0, column=1, padx=3)
+    dialog.bind("<Return>", lambda event: accept())
+    dialog.bind("<Escape>", lambda event: dialog.destroy())
+    dialog.grab_set()
+    parent.wait_window(dialog)
+    return result or None
 
 
 def main() -> None:

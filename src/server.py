@@ -22,7 +22,7 @@ from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from lexicon.db import LexiconDatabase
 from lexicon.backups import backup_database, backup_materials
 from lexicon.edits import apply_edits, key_of, material_path
-from lexicon.materials import MATERIALS_DIR, file_label, load_entries, material_paths, sync_paths
+from lexicon.materials import MATERIALS_DIR, file_label, material_paths, read_payload, sync_paths
 from lexicon.paths import CERT_DIR, DEFAULT_DB_PATH, ROOT
 
 SRC_DIR = ROOT / "src"
@@ -91,7 +91,7 @@ def version():
 
 @app.post("/api/sync")
 def sync():
-    """ブラウザ版の回答履歴をすべて受け取って Mac の DB に足し、ブラウザ版にない Mac の回答履歴を返す"""
+    """ブラウザ版の回答履歴をすべて受け取って Mac の DB に足し、ブラウザ版にない Mac の回答履歴を返す。既習の印も合わせる"""
     payload = request.get_json(force=True)
     rows = payload.get("rows", [])
     database = open_db()
@@ -99,9 +99,12 @@ def sync():
         added, skipped = database.merge_history(rows)
         client_uids = {row["uid"] for row in rows}
         missing = database.history_rows(exclude_uids=client_uids)
+        # 既習の印は新しく変えたほうを残して、まとめたものを返す
+        database.merge_known(payload.get("known", []))
+        known = database.known_rows()
     finally:
         database.close()
-    return jsonify({"added": added, "skipped": skipped, "rows": missing})
+    return jsonify({"added": added, "skipped": skipped, "rows": missing, "known": known})
 
 
 @app.get("/api/content")
@@ -120,9 +123,9 @@ def content():
 
 @app.get("/api/materials")
 def materials():
-    """教材JSONの写し。ブラウザ版の単語エディタが編集に使う"""
+    """教材JSONの写し (ファイルの設定ごと、ファイルの中身のまま)。ブラウザ版の単語エディタが編集に使う"""
     directory = app.config["MATERIALS_DIR"]
-    return jsonify({"files": {file_label(path, directory): load_entries(path) for path in material_paths(directory)}})
+    return jsonify({"files": {file_label(path, directory): read_payload(path) for path in material_paths(directory)}})
 
 
 @app.post("/api/edits")

@@ -11,6 +11,11 @@ SCORE_MODE_LABELS = {
     "未習得スコア (未回答・回答の少ない単語も優先)": "unlearned",
     "誤答スコア (最近間違えた単語だけを優先。見直し用)": "incorrect",
 }
+# テストモード: 範囲の単語を1周ずつランダムな順で全部出す (外→日・日→外だけ)。出題数の代わりに周回数を選ぶ
+TEST_MODE = "test"
+TEST_MODE_LABEL = "テスト (範囲の単語を全部・ランダムな順で。外→日・日→外のみ)"
+QUIZ_MODE_LABELS = {**SCORE_MODE_LABELS, TEST_MODE_LABEL: TEST_MODE}
+MAX_TEST_ROUNDS = 10
 # 問題形式のIDは回答履歴に保存されるため変えない。表示名の {lang} は選んだ言語の略称 (英・独など) になる
 QUESTION_TYPES = [
     ("{lang}→日", "english_to_japanese"),

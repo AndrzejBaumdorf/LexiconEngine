@@ -63,6 +63,8 @@ def pool_columns(pool: str) -> list[Column]:
 
 def build_columns(pools: list[str]) -> list[Column]:
     return [
+        # 既習の印。クリックで付け外しする (付けた単語は出題の基礎の重みが下がる)
+        Column("known", "既習", 45, False, lambda stats: not stats.known, lambda stats: "☑" if stats.known else "☐"),
         Column("word", "単語", 140, False, lambda stats: stats.word.casefold(), lambda stats: stats.word),
         Column("parts_of_speech", "品詞", 70, False, lambda stats: stats.parts_of_speech, lambda stats: stats.parts_of_speech),
         Column("meanings", "意味", 280, False, lambda stats: stats.meanings, lambda stats: stats.meanings),
@@ -130,6 +132,9 @@ class WordList(tk.Toplevel):
         scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<Button-1>", self._on_click)
+        # 表の行 (iid) → 単語一覧の行
+        self.visible: dict[str, WordStats] = {}
 
         self.status_var = tk.StringVar()
         ttk.Label(self, textvariable=self.status_var, foreground="gray").grid(row=2, column=0, sticky="w", padx=10, pady=(5, 10))
@@ -152,7 +157,8 @@ class WordList(tk.Toplevel):
         self.tree.configure(columns=[column.id for column in self.columns])
         for column in self.columns:
             self.tree.heading(column.id, command=lambda column_id=column.id: self.sort_by(column_id))
-            self.tree.column(column.id, width=column.width, anchor="e" if column.numeric else "w", stretch=column.id in ("meanings", "sources"))
+            anchor = "center" if column.id == "known" else "e" if column.numeric else "w"
+            self.tree.column(column.id, width=column.width, anchor=anchor, stretch=column.id in ("meanings", "sources"))
         if self.sort_column not in {column.id for column in self.columns}:
             self.sort_column, self.sort_descending = f"{MEANING_POOL}_score", True
 
@@ -190,6 +196,22 @@ class WordList(tk.Toplevel):
             text=f"活用クイズは 単語の誤り率 × {spec.conjugation_row_label}の誤り率 × 時制の誤り率 に比例して出題します (セットの開始時と50問ごとに更新)",
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
 
+    def _on_click(self, event: tk.Event) -> str | None:
+        """既習の列をクリックしたら、その単語の既習の印を付け外しする"""
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return None
+        column_index = int(self.tree.identify_column(event.x)[1:]) - 1
+        iid = self.tree.identify_row(event.y)
+        if self.columns[column_index].id != "known" or iid not in self.visible:
+            return None
+        stats = self.visible[iid]._replace(known=not self.visible[iid].known)
+        self.database.set_known(self.language_var.get(), stats.word, stats.known)
+        self.rows = [stats if row.word_id == stats.word_id else row for row in self.rows]
+        self.visible[iid] = stats
+        self.tree.item(iid, values=[column.text(stats) for column in self.columns])
+        self._update_status()
+        return "break"
+
     def refresh(self) -> None:
         self.rows = self.database.word_stats(self.language_var.get(), self.type_values.get(self.type_var.get()))
         self._fill()
@@ -226,22 +248,28 @@ class WordList(tk.Toplevel):
 
     def _fill(self) -> None:
         self.tree.delete(*self.tree.get_children())
+        self.visible = {}
         rows = self._visible_rows()
         # 色分けは並べ替えている集計単位の誤答スコアで行う (性で並べ替えたら性の誤答スコア)。未回答は灰色
         color_pool = self._sort_column().pool or MEANING_POOL
         for stats in rows:
             score = stats.pool(color_pool).incorrect
             tag = "unanswered" if score is None else "low" if score >= HIGH_SCORE else "middle" if score >= MIDDLE_SCORE else ""
-            self.tree.insert("", "end", values=[column.text(stats) for column in self.columns], tags=(tag,) if tag else ())
+            iid = self.tree.insert("", "end", values=[column.text(stats) for column in self.columns], tags=(tag,) if tag else ())
+            self.visible[iid] = stats
         for column in self.columns:
             arrow = (" ▼" if self.sort_descending else " ▲") if column.id == self.sort_column else ""
             self.tree.heading(column.id, text=column.heading + arrow)
+        self._update_status()
+
+    def _update_status(self) -> None:
+        color_pool = self._sort_column().pool or MEANING_POOL
         summaries = []
         for pool in self.pools:
             answered = sum(stats.pool(pool).answered for stats in self.rows)
             if answered:
                 summaries.append(f"{POOL_LABELS[pool]} {answered}")
         self.status_var.set(
-            f"表示 {len(rows)}語 / 全{len(self.rows)}語  回答数: {'、'.join(summaries) or 'まだ回答がありません'}"
-            f" — 列見出しをクリックで並べ替え。{POOL_LABELS[color_pool]}の誤答スコア (直近の誤答ほど重い) {HIGH_SCORE} 以上は赤、{MIDDLE_SCORE} 以上は橙"
+            f"表示 {len(self.visible)}語 / 全{len(self.rows)}語 (既習 {sum(stats.known for stats in self.rows)}語)  回答数: {'、'.join(summaries) or 'まだ回答がありません'}"
+            f" — 既習の ☐ をクリックで付け外し (既習の単語は出にくくなる)。列見出しをクリックで並べ替え。{POOL_LABELS[color_pool]}の誤答スコア (直近の誤答ほど重い) {HIGH_SCORE} 以上は赤、{MIDDLE_SCORE} 以上は橙"
         )
