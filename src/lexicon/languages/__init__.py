@@ -192,22 +192,24 @@ ENGLISH = Language(
     inflect_to=english.inflect,
     form_parts_of_speech={"past": "動詞", "participle": "動詞", "ing": "動詞"},
 )
+GERMAN_VERB_FIELDS = (
+    FormField("present_3sg", "現在 3人称単数"),
+    FormField("past", "過去形"),
+    FormField("perfect", "現在完了", cloze_token=-1),
+)
 GERMAN = Language(
     "German",
     ("Deutsch", "ドイツ語"),
     "独",
-    parts_of_speech=("名詞", "動詞", "形容詞", "副詞", "前置詞", "接続詞", "代名詞", "冠詞", "数詞", "熟語"),
+    parts_of_speech=("名詞", "動詞", "助動詞", "形容詞", "副詞", "前置詞", "接続詞", "代名詞", "冠詞", "数詞", "熟語"),
     articles={"m": "der", "f": "die", "n": "das"},
+    # 助動詞 (können・werden など) も動詞と同じ活用の欄を出す
     form_fields={
         "名詞": (
             FormField("gender", "性", cloze_token=None),
             FormField("plural", "複数形", headword_format="複数: {}"),
         ),
-        "動詞": (
-            FormField("present_3sg", "現在 3人称単数"),
-            FormField("past", "過去形"),
-            FormField("perfect", "現在完了", cloze_token=-1),
-        ),
+        **{part: GERMAN_VERB_FIELDS for part in ("動詞", "助動詞")},
     },
     inflect=_german_forms,
     plural_article="die",
